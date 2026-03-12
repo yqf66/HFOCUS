@@ -1,342 +1,762 @@
 """
-短视频高风险帧筛选模块（即插即用）
-核心功能：基于无监督视觉特征（信息量+变化度+稀有度），对短视频密集采样并筛选高风险帧，
-         交给后续有害内容判断模块，无需标注/训练，纯轻量级计算。
+短视频帧采样流水线（即插即用）
+==================================
+架构：
+    X  = 均匀下采样保底帧（确保全程覆盖，应对全程平缓有害视频）
+    a  = 事件突变帧（捕捉转瞬即逝的异常画面）
+    X' = a 按时序插入 X 并去重 → 最终输入下游理解分析模块
+
+资源模式：
+    low  — 固定总帧数（如40帧），无论视频多长都均匀采样固定数量
+    high — 按FPS采样（如每秒2帧），帧数随视频时长线性增长
+
+输出：
+    result.frames_X_prime / indices_X_prime  → 合并后的完整视频流 X'
+    result.frames_a / indices_a / scores_a   → 单独的事件帧集合 a
+
 使用方式：
-    from risk_frame_selector import RiskFrameSelector
-    
-    selector = RiskFrameSelector(sample_fps=10, top_k=5)
-    high_risk_frames = selector.select(video_path="your_video.mp4")
+    from video_frame_pipeline import VideoFramePipeline
+
+    # 低资源模式：固定采40帧保底
+    pipeline = VideoFramePipeline(
+        baseline_mode="low",
+        baseline_fixed_frames=40,
+    )
+
+    # 高资源模式：每秒采2帧保底
+    pipeline = VideoFramePipeline(
+        baseline_mode="high",
+        baseline_fps=2.0,
+    )
+
+    result = pipeline.process(video_path="your_video.mp4")
 """
 
 import numpy as np
 import cv2
-from decord import VideoReader, cpu
-from typing import List, Optional
-from scipy.ndimage import gaussian_filter
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import MinMaxScaler
+from typing import List, Tuple, Optional, Dict
+from dataclasses import dataclass, field
+from scipy.signal import find_peaks
 import warnings
 import os
-warnings.filterwarnings("ignore")  # 屏蔽sklearn聚类警告
+import logging
+
+warnings.filterwarnings("ignore")
+
+# ===================== 日志 =====================
+logger = logging.getLogger("VideoFramePipeline")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        "[%(name)s %(levelname)s] %(message)s"
+    ))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 
-class RiskFrameSelector:
-    """短视频高风险帧筛选器（即插即用）"""
-    
+# ===================== 数据结构 =====================
+@dataclass
+class VideoInfo:
+    """视频元信息"""
+    path: str = ""
+    total_frames: int = 0
+    fps: float = 0.0
+    duration_sec: float = 0.0
+    width: int = 0
+    height: int = 0
+
+
+@dataclass
+class PipelineResult:
+    """
+    流水线输出结果
+    同时提供合并流 X' 和独立事件帧 a，下游按需取用
+    """
+    # ===== 合并帧流 X'（保底 + 事件，按时序排列）=====
+    frames_X_prime: List[np.ndarray] = field(default_factory=list)
+    indices_X_prime: List[int] = field(default_factory=list)
+    source_tags: List[str] = field(default_factory=list)      # "baseline" / "event"
+    merged_scores: List[float] = field(default_factory=list)   # 事件帧带分数，保底帧为0.0
+
+    # ===== 独立事件帧 a（仅事件帧，按分数降序）=====
+    frames_a: List[np.ndarray] = field(default_factory=list)
+    indices_a: List[int] = field(default_factory=list)
+    scores_a: List[float] = field(default_factory=list)
+
+    # ===== 保底帧 X（仅保底帧）=====
+    indices_X: List[int] = field(default_factory=list)
+
+    # ===== 元信息 =====
+    video_info: VideoInfo = field(default_factory=VideoInfo)
+    baseline_mode: str = ""               # "low" / "high"
+    baseline_frame_count: int = 0         # 保底帧数量
+    event_count: int = 0                  # 事件帧数量
+    total_output_frames: int = 0          # X' 总帧数
+
+    def summary(self) -> str:
+        mode_desc = (
+            f"固定{self.baseline_frame_count}帧"
+            if self.baseline_mode == "low"
+            else f"按FPS采样{self.baseline_frame_count}帧"
+        )
+        lines = [
+            f"视频: {os.path.basename(self.video_info.path)}",
+            f"时长: {self.video_info.duration_sec:.1f}s | "
+            f"原始FPS: {self.video_info.fps:.1f} | "
+            f"总帧数: {self.video_info.total_frames}",
+            f"模式: {self.baseline_mode} ({mode_desc})",
+            f"保底帧(X): {self.baseline_frame_count} 帧",
+            f"事件帧(a): {self.event_count} 帧",
+            f"合并帧(X'): {self.total_output_frames} 帧",
+        ]
+        if self.scores_a:
+            lines.append(
+                f"事件帧分数: max={max(self.scores_a):.3f}, "
+                f"min={min(self.scores_a):.3f}, "
+                f"avg={np.mean(self.scores_a):.3f}"
+            )
+        return "\n".join(lines)
+
+
+# ===================== 事件帧检测器 =====================
+class EventFrameDetector:
+    """
+    事件突变帧检测器
+    职责：从密集采样的灰度帧序列中定位时序突变点
+    方法：帧间差异 + 双向闪帧检测 + 直方图分布突变，Z-score异常筛选
+    """
+
     def __init__(
         self,
-        sample_fps: int = 10,
-        top_k: int = 5,
-        min_gap_sec: float = 0.1,
-        weight_entropy: float = 0.3,
-        weight_diff: float = 0.5,
-        weight_rarity: float = 0.2,
-        # OPTIMIZE: 将过滤阈值参数化，增加灵活性
+        flash_sensitivity: float = 2.5,
+        anomaly_sensitivity: float = 2.0,
+        min_gap_sec: float = 0.03,
+        max_events: int = 30,
+    ):
+        self.flash_sensitivity = flash_sensitivity
+        self.anomaly_sensitivity = anomaly_sensitivity
+        self.min_gap_sec = min_gap_sec
+        self.max_events = max_events
+
+    def _compute_temporal_signals(
+        self, grays: List[np.ndarray]
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        计算三组时序信号：
+          1. diff_signal:    与前帧的像素级差异
+          2. flash_signal:   双向突变度（闪帧核心指标）
+          3. feature_signal: 直方图分布突变（巴氏距离）
+        """
+        n = len(grays)
+        small_size = (64, 64)
+
+        smalls = [cv2.resize(g, small_size).astype(np.float32) for g in grays]
+
+        hists = []
+        for g in grays:
+            h = cv2.calcHist([g], [0], None, [64], [0, 256]).flatten()
+            h = h / (h.sum() + 1e-10)
+            hists.append(h)
+
+        diff_signal = np.zeros(n)
+        flash_signal = np.zeros(n)
+        feature_signal = np.zeros(n)
+
+        for i in range(n):
+            if i > 0:
+                diff_signal[i] = float(np.mean(np.abs(smalls[i] - smalls[i - 1])))
+
+            if 0 < i < n - 1:
+                d_prev = float(np.mean(np.abs(smalls[i] - smalls[i - 1])))
+                d_next = float(np.mean(np.abs(smalls[i] - smalls[i + 1])))
+                d_surround = float(np.mean(np.abs(smalls[i - 1] - smalls[i + 1])))
+                flash_signal[i] = max(0.0, (d_prev + d_next) / 2.0 - d_surround)
+
+            if i > 0:
+                hist_dist = cv2.compareHist(
+                    hists[i].astype(np.float32),
+                    hists[i - 1].astype(np.float32),
+                    cv2.HISTCMP_BHATTACHARYYA
+                )
+                feature_signal[i] = hist_dist
+
+        return diff_signal, flash_signal, feature_signal
+
+    def detect(
+        self, grays: List[np.ndarray], indices: List[int], fps: float
+    ) -> Tuple[List[int], List[float]]:
+        """
+        检测事件帧
+        Returns: (event_indices, event_scores) 按分数降序排列
+        """
+        n = len(grays)
+        if n < 3:
+            return [], []
+
+        diff_signal, flash_signal, feature_signal = (
+            self._compute_temporal_signals(grays)
+        )
+
+        # (1) 帧间差异异常
+        diff_mean, diff_std = diff_signal.mean(), diff_signal.std()
+        if diff_std > 1e-10:
+            diff_zscore = (diff_signal - diff_mean) / diff_std
+            diff_anomaly = np.maximum(diff_zscore - self.anomaly_sensitivity, 0)
+        else:
+            diff_anomaly = np.zeros(n)
+
+        # (2) 闪帧异常（Z-score + 峰值检测）
+        flash_anomaly = np.zeros(n)
+        flash_mean, flash_std = flash_signal.mean(), flash_signal.std()
+        if flash_std > 1e-10:
+            flash_threshold = flash_mean + self.flash_sensitivity * flash_std
+            peaks, props = find_peaks(
+                flash_signal, height=flash_threshold, distance=1
+            )
+            if len(peaks) > 0:
+                ph = props["peak_heights"]
+                ph_max = ph.max()
+                if ph_max > 1e-10:
+                    for pi, pk in enumerate(peaks):
+                        flash_anomaly[pk] = ph[pi] / ph_max
+
+        # (3) 直方图分布突变
+        feat_mean, feat_std = feature_signal.mean(), feature_signal.std()
+        if feat_std > 1e-10:
+            feat_zscore = (feature_signal - feat_mean) / feat_std
+            feat_anomaly = np.maximum(feat_zscore - self.anomaly_sensitivity, 0)
+        else:
+            feat_anomaly = np.zeros(n)
+
+        # 融合
+        anomaly_scores = (
+            diff_anomaly * 0.30
+            + flash_anomaly * 0.45
+            + feat_anomaly * 0.25
+        )
+
+        # 筛选
+        if anomaly_scores.max() < 1e-10:
+            return [], []
+
+        anomaly_norm = anomaly_scores / anomaly_scores.max()
+
+        candidates = [
+            (indices[i], float(anomaly_norm[i]))
+            for i in range(n) if anomaly_norm[i] > 0
+        ]
+        candidates.sort(key=lambda x: x[1], reverse=True)
+
+        # 带最小间隔的选择
+        min_gap_frames = max(1, int(fps * self.min_gap_sec))
+        selected_indices = []
+        selected_scores = []
+
+        for idx, score in candidates:
+            if len(selected_indices) >= self.max_events:
+                break
+            if all(abs(idx - s) >= min_gap_frames for s in selected_indices):
+                selected_indices.append(idx)
+                selected_scores.append(score)
+
+        return selected_indices, selected_scores
+
+
+# ===================== 主流水线 =====================
+class VideoFramePipeline:
+    """
+    视频帧采样流水线
+    X(保底) + a(事件) → X'(合并)
+
+    支持两种保底采样模式：
+      low  — 固定帧数，适合下游模型上下文窗口有限的场景
+      high — 按FPS采样，适合算力充足的场景
+    """
+
+    def __init__(
+        self,
+        # ===== 保底帧采样配置 =====
+        baseline_mode: str = "low",
+        baseline_fixed_frames: int = 40,   # low模式：固定采样帧数
+        baseline_fps: float = 2.0,         # high模式：每秒采样帧数
+        # ===== 事件检测配置 =====
+        event_sample_fps: int = 10,
+        flash_sensitivity: float = 2.5,
+        anomaly_sensitivity: float = 2.0,
+        event_min_gap_sec: float = 0.03,
+        max_events: int = 30,
+        # ===== 合并配置 =====
+        merge_dedup_frames: int = 2,
+        # ===== 过滤配置 =====
         thresh_black_screen: float = 10.0,
         thresh_blur: float = 50.0,
-        thresh_static: float = 5.0
     ):
         """
-        初始化筛选器
         Args:
-            sample_fps: 1秒内采样的帧数（推荐10，兼顾速度和精度）
-            top_k: 最终输出的高风险帧数（根据后续模块算力调整）
-            min_gap_sec: 避免选中的帧扎堆（比如0.1秒=100ms）
-            weight_entropy/weight_diff/weight_rarity: 特征融合权重
-            thresh_black_screen: 黑屏检测的灰度均值阈值
-            thresh_blur: 模糊检测的拉普拉斯方差阈值
-            thresh_static: 静态帧检测的帧间差异阈值
+            baseline_mode: "low"(固定帧数) 或 "high"(按FPS)
+            baseline_fixed_frames: low模式下的固定采样帧数
+            baseline_fps: high模式下的每秒采样帧数
+            event_sample_fps: 事件检测的密集采样帧率
+            flash_sensitivity: 闪帧检测灵敏度
+            anomaly_sensitivity: 一般异常检测灵敏度
+            event_min_gap_sec: 事件帧最小时间间隔
+            max_events: 单视频最多事件帧数
+            merge_dedup_frames: 合并去重距离（帧索引差<=此值视为重复）
+            thresh_black_screen: 黑屏检测阈值
+            thresh_blur: 模糊检测阈值
         """
-        self.sample_fps = sample_fps
-        self.top_k = top_k
-        self.min_gap_sec = min_gap_sec
-        self.weight_entropy = weight_entropy
-        self.weight_diff = weight_diff
-        self.weight_rarity = weight_rarity
-        # OPTIMIZE: 保存过滤阈值
+        if baseline_mode not in ("low", "high"):
+            raise ValueError(
+                f"baseline_mode 必须是 'low' 或 'high'，收到: {baseline_mode}"
+            )
+
+        self.baseline_mode = baseline_mode
+        self.baseline_fixed_frames = baseline_fixed_frames
+        self.baseline_fps = baseline_fps
+        self.event_sample_fps = event_sample_fps
+        self.merge_dedup_frames = merge_dedup_frames
         self.thresh_black_screen = thresh_black_screen
         self.thresh_blur = thresh_blur
-        self.thresh_static = thresh_static
-        
-    # ===================== 核心工具函数 =====================
-    def _calculate_frame_entropy(self, frame: np.ndarray) -> float:
-        """计算单帧图像熵（信息量）：熵越高，信息量越大"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
-        hist_norm = hist / hist.sum()
-        entropy = -np.sum([p * np.log2(p + 1e-10) for p in hist_norm if p > 0])
-        return float(entropy)
-    
-    def _calculate_frame_gradient(self, frame: np.ndarray) -> float:
-        """计算单帧梯度幅值（边缘强度）：梯度越高，细节越丰富"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        gray_smooth = gaussian_filter(gray, sigma=1)
-        grad_x = cv2.Sobel(gray_smooth, cv2.CV_64F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(gray_smooth, cv2.CV_64F, 0, 1, ksize=3)
-        grad_mag = np.sqrt(grad_x**2 + grad_y**2)
-        return float(np.mean(grad_mag))
-    
-    def _calculate_frame_diff(self, frame: np.ndarray, ref_frame: np.ndarray) -> float:
-        """计算帧间差异：差异越大，画面变化越剧烈"""
-        # 降采样+转灰度，加速计算
-        frame_gray = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY), (64, 64))
-        ref_gray = cv2.resize(cv2.cvtColor(ref_frame, cv2.COLOR_RGB2GRAY), (64, 64))
-        diff = cv2.absdiff(frame_gray, ref_gray)
-        return float(np.mean(diff))
-    
-    def _filter_low_value_frames(self, video: VideoReader, indices: List[int]) -> List[int]:
-        """过滤低价值帧：黑屏、全模糊、静态帧"""
-        valid_indices = []
-        for i, idx in enumerate(indices):
-            frame = video[idx].asnumpy()
-            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-            
-            # 1. 黑屏检测
-            if np.mean(gray) < self.thresh_black_screen:
-                continue
-            
-            # 2. 模糊检测
-            laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-            if np.var(laplacian) < self.thresh_blur:
-                continue
-            
-            # 3. 静态帧检测
-            # OPTIMIZE: 避免重复读取前一帧，如果前一帧在采样列表中，则直接复用
-            if i > 0:
-                prev_idx = indices[i-1]
-                # 只有当两帧在视频中是连续的时候才进行比较
-                if idx == prev_idx + 1:
-                    prev_frame = video[prev_idx].asnumpy()
-                    diff = self._calculate_frame_diff(frame, prev_frame)
-                    if diff < self.thresh_static:
-                        continue
-            
-            valid_indices.append(idx)
-        
-        # 兜底：如果过滤后无有效帧，返回原始采样帧
-        return valid_indices if valid_indices else indices[:self.top_k * 2]
-    
-    def _calculate_risk_scores(self, frames: List[np.ndarray], indices: List[int]) -> List[float]:
-        """计算帧的无监督风险分数（核心）"""
-        # OPTIMIZE: 传入帧列表，避免重复读取
-        
-        # 步骤1：提取基础特征（熵+梯度）
-        frame_features = []
-        for frame in frames:
-            entropy = self._calculate_frame_entropy(frame)
-            gradient = self._calculate_frame_gradient(frame)
-            frame_features.append([entropy, gradient])
-        frame_features = np.array(frame_features)
-        
-        # 归一化特征
-        scaler = MinMaxScaler()
-        frame_features_norm = scaler.fit_transform(frame_features)
-        # 信息量分数（熵+梯度融合）
-        info_scores = frame_features_norm[:, 0] * 0.5 + frame_features_norm[:, 1] * 0.5
-        
-        # 步骤2：计算帧变化度分数
-        diff_scores = np.zeros(len(indices))
-        if len(indices) >= 2:
-            for i in range(len(frames)):
-                # 取相邻帧作为参考
-                ref_frame = frames[i-1] if i > 0 else frames[1]
-                diff_scores[i] = self._calculate_frame_diff(frames[i], ref_frame)
-            diff_scores = scaler.fit_transform(diff_scores.reshape(-1, 1)).flatten()
-        
-        # 步骤3：计算帧稀有度分数（聚类）
-        rarity_scores = np.ones(len(indices)) * 0.5
-        if len(indices) >= 5:  # 至少5帧才聚类
-            # OPTIMIZE: 明确设置n_init以保证结果稳定并兼容新版sklearn
-            kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
-            clusters = kmeans.fit_predict(frame_features_norm)
-            cluster_counts = np.bincount(clusters)
-            for i, c in enumerate(clusters):
-                rarity_scores[i] = 1.0 - (cluster_counts[c] / len(indices))
-        
-        # 步骤4：融合最终风险分数
-        final_scores = (
-            info_scores * self.weight_entropy +
-            diff_scores * self.weight_diff +
-            rarity_scores * self.weight_rarity
+
+        self.event_detector = EventFrameDetector(
+            flash_sensitivity=flash_sensitivity,
+            anomaly_sensitivity=anomaly_sensitivity,
+            min_gap_sec=event_min_gap_sec,
+            max_events=max_events,
         )
-        # 归一化到0~1
-        final_scores = scaler.fit_transform(final_scores.reshape(-1, 1)).flatten()
-        return [max(0.0, min(1.0, float(s))) for s in final_scores]
-    
-    def _select_topk_with_gap(self, indices: List[int], scores: List[float]) -> List[int]:
-        """选TopK帧，且满足最小时间间隔"""
-        # 按分数降序排序
-        sorted_pairs = sorted(zip(indices, scores), key=lambda x: x[1], reverse=True)
-        selected = []
-        fps = self._video_fps  # 缓存的视频帧率
-        
-        # 最小间隔（帧数）
-        min_gap_frames = max(1, int(fps * self.min_gap_sec))
-        
-        # 第一轮：严格满足时间间隔
-        for idx, score in sorted_pairs:
-            if all(abs(idx - s) >= min_gap_frames for s in selected):
-                selected.append(idx)
-                if len(selected) == self.top_k:
-                    break
-        
-        # 第二轮：若数量不够，放宽间隔补充
-        if len(selected) < self.top_k:
-            for idx, score in sorted_pairs:
-                if idx not in selected:
-                    selected.append(idx)
-                    if len(selected) == self.top_k:
-                        break
-        
-        return sorted(selected)
-    
-    # ===================== 对外核心接口 =====================
-    def select(self, video_path: str) -> List[int]:
-        """
-        核心调用接口：筛选短视频的高风险帧。
-        如果主方案 (Decord) 失败，会自动切换到备用方案 (OpenCV) 进行完整的风险分析。
-        """
-        try:
-            # =================== 主方案: 使用Decord进行分析 ===================
-            print("正在使用主方案 (Decord) 进行风险分析...")
-            video = VideoReader(video_path, ctx=cpu(0))
-            total_frames = len(video)
-            self._video_fps = video.get_avg_fps()
-            
-            sample_interval = max(1, int(self._video_fps / self.sample_fps))
-            sampled_indices = list(range(0, total_frames, sample_interval))
-            
-            valid_indices = self._filter_low_value_frames(video, sampled_indices)
-            valid_frames = [video[idx].asnumpy() for idx in valid_indices]
-            
-            risk_scores = self._calculate_risk_scores(valid_frames, valid_indices)
-            high_risk_frames = self._select_topk_with_gap(valid_indices, risk_scores)
-            print("Decord 分析成功。")
-            return high_risk_frames
-        
-        except Exception as e:
-            print(f"主方案 (Decord) 分析失败: {e}")
-            print("切换到备用方案 (OpenCV) 进行完整风险分析...")
-            try:
-                # =================== 备用方案: 使用OpenCV进行完整分析 ===================
-                cap = cv2.VideoCapture(video_path)
-                if not cap.isOpened():
-                    raise IOError(f"OpenCV 无法打开视频: {video_path}")
-                
-                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                fps = cap.get(cv2.CAP_PROP_FPS)
-                self._video_fps = fps
 
-                sample_interval = max(1, int(fps / self.sample_fps))
-                sampled_indices = list(range(0, total_frames, sample_interval))
+    # ==================== 视频读取 ====================
 
-                # 使用OpenCV重新实现过滤逻辑
-                valid_indices = []
-                temp_frames_for_filter = {}
-                for i, idx in enumerate(sampled_indices):
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                    ret, frame_bgr = cap.read()
-                    if not ret: continue
-                    
-                    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-                    if np.mean(gray) < self.thresh_black_screen: continue
-                    if np.var(cv2.Laplacian(gray, cv2.CV_64F)) < self.thresh_blur: continue
-                    
-                    # 静态帧检测
-                    if i > 0:
-                        prev_idx = sampled_indices[i-1]
-                        if idx == prev_idx + 1:
-                            # 从缓存或文件中读取前一帧
-                            if prev_idx in temp_frames_for_filter:
-                                prev_frame_bgr = temp_frames_for_filter[prev_idx]
-                            else:
-                                cap.set(cv2.CAP_PROP_POS_FRAMES, prev_idx)
-                                _, prev_frame_bgr = cap.read()
-                            
-                            if prev_frame_bgr is not None:
-                                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                                prev_frame_rgb = cv2.cvtColor(prev_frame_bgr, cv2.COLOR_BGR2RGB)
-                                if self._calculate_frame_diff(frame_rgb, prev_frame_rgb) < self.thresh_static:
-                                    continue
-                    
-                    valid_indices.append(idx)
-                    temp_frames_for_filter[idx] = frame_bgr # 缓存已读取的帧
-                
-                # 从有效索引中读取所有帧 (BGR格式)
-                valid_frames_bgr = []
-                for idx in valid_indices:
-                    if idx in temp_frames_for_filter:
-                        valid_frames_bgr.append(temp_frames_for_filter[idx])
-                    else:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                        ret, frame_bgr = cap.read()
-                        if ret: valid_frames_bgr.append(frame_bgr)
-                cap.release()
-
-                # 将帧转为RGB以进行风险计算
-                valid_frames_rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in valid_frames_bgr]
-
-                risk_scores = self._calculate_risk_scores(valid_frames_rgb, valid_indices)
-                high_risk_frames = self._select_topk_with_gap(valid_indices, risk_scores)
-                print("OpenCV 备用分析成功。")
-                return high_risk_frames
-
-            except Exception as fallback_e:
-                print(f"备用方案 (OpenCV) 分析也失败了: {fallback_e}")
-                return [] # 彻底失败，返回空列表
-
-
-# ===================== 测试用例（可直接运行） =====================
-if __name__ == "__main__":
-    # 优化：保存帧函数，统一使用更兼容的OpenCV进行读取和保存
-    def save_frames(video_path: str, frame_indices: List[int], output_dir: str):
-        """将指定索引的帧从视频中提取并保存到文件夹"""
-        if not frame_indices:
-            print("没有需要保存的帧，程序终止。")
-            return
-
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-            print(f"创建输出目录：{output_dir}")
-
-        print(f"准备从 {video_path} 提取 {len(frame_indices)} 帧...")
+    def _open_video(self, video_path: str) -> Tuple[cv2.VideoCapture, VideoInfo]:
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            print(f"错误：无法使用OpenCV打开视频 {video_path} 进行最终保存。")
-            return
+            raise IOError(f"无法打开视频: {video_path}")
 
-        saved_count = 0
-        for idx in frame_indices:
+        info = VideoInfo(
+            path=video_path,
+            total_frames=int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
+            fps=cap.get(cv2.CAP_PROP_FPS),
+            width=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            height=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        )
+        if info.fps <= 0:
+            info.fps = 25.0
+        info.duration_sec = info.total_frames / info.fps
+        return cap, info
+
+    def _sequential_read_frames(
+        self, cap: cv2.VideoCapture, target_indices: List[int], total_frames: int
+    ) -> Dict[int, np.ndarray]:
+        """顺序读取指定索引的帧（用grab跳帧，比随机seek快）"""
+        frames = {}
+        sorted_targets = sorted(set(target_indices))
+        if not sorted_targets:
+            return frames
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        current_pos = 0
+
+        for target in sorted_targets:
+            if target >= total_frames:
+                break
+            skip = target - current_pos
+            if skip > 0:
+                for _ in range(skip):
+                    if not cap.grab():
+                        break
+                current_pos = target
+
+            ret, frame = cap.read()
+            current_pos += 1
+            if ret:
+                frames[target] = frame
+
+        return frames
+
+    # ==================== X: 保底帧采样 ====================
+
+    def _sample_baseline(self, info: VideoInfo) -> List[int]:
+        """
+        根据模式生成保底帧索引
+
+        low模式:  无论视频多长，均匀采样固定数量的帧
+                  例: 30s视频30fps=900帧, 固定采40帧 → 每22帧取1帧
+                  例: 2s视频30fps=60帧, 固定采40帧  → 采40帧（不足时取实际数量）
+
+        high模式: 按FPS采样，帧数随时长线性增长
+                  例: 30s视频, 2fps → 60帧
+                  例: 120s视频, 2fps → 240帧
+        """
+        total = info.total_frames
+
+        if self.baseline_mode == "low":
+            n_frames = min(self.baseline_fixed_frames, total)
+            if n_frames <= 0:
+                return []
+            # np.linspace 保证首尾帧都被采到，且分布均匀
+            raw_indices = np.linspace(0, total - 1, n_frames, dtype=int)
+            indices = list(dict.fromkeys(raw_indices.tolist()))  # 去重保序
+            logger.info(
+                f"保底帧(X) [low模式]: 目标{self.baseline_fixed_frames}帧 → "
+                f"实际{len(indices)}帧 (视频共{total}帧)"
+            )
+        else:  # high
+            interval = max(1, int(info.fps / self.baseline_fps))
+            indices = list(range(0, total, interval))
+            logger.info(
+                f"保底帧(X) [high模式]: {self.baseline_fps}fps, "
+                f"间隔={interval} → {len(indices)}帧"
+            )
+
+        return indices
+
+    # ==================== a: 事件帧检测 ====================
+
+    def _detect_events(
+        self, cap: cv2.VideoCapture, info: VideoInfo,
+    ) -> Tuple[List[int], List[float]]:
+        """密集采样 → 过滤 → 事件检测"""
+        interval = max(1, int(info.fps / self.event_sample_fps))
+        dense_indices = list(range(0, info.total_frames, interval))
+
+        logger.info(
+            f"事件检测: 密集采样{len(dense_indices)}帧 (间隔={interval})"
+        )
+
+        frame_dict = self._sequential_read_frames(
+            cap, dense_indices, info.total_frames
+        )
+
+        valid_indices = []
+        valid_grays = []
+
+        for idx in dense_indices:
+            if idx not in frame_dict:
+                continue
+            gray = cv2.cvtColor(frame_dict[idx], cv2.COLOR_BGR2GRAY)
+
+            if np.mean(gray) < self.thresh_black_screen:
+                continue
+            if np.var(cv2.Laplacian(gray, cv2.CV_64F)) < self.thresh_blur:
+                continue
+
+            valid_indices.append(idx)
+            valid_grays.append(gray)
+
+        logger.info(f"事件检测有效帧: {len(valid_indices)} / {len(dense_indices)}")
+
+        if len(valid_indices) < 3:
+            return [], []
+
+        event_indices, event_scores = self.event_detector.detect(
+            valid_grays, valid_indices, info.fps
+        )
+        logger.info(f"检测到事件帧: {len(event_indices)} 个")
+        return event_indices, event_scores
+
+    # ==================== 合并 X + a → X' ====================
+
+    def _merge(
+        self,
+        baseline_indices: List[int],
+        event_indices: List[int],
+        event_scores: List[float],
+    ) -> Tuple[List[int], List[str], List[float]]:
+        """
+        事件帧按时序插入保底帧，去重合并
+        去重规则：事件帧与保底帧索引差 <= merge_dedup_frames 时，
+                 用事件帧替换保底帧（保留更有价值的标记）
+        """
+        event_score_map = dict(zip(event_indices, event_scores))
+
+        merged = {}  # index -> (source_tag, score)
+
+        for idx in baseline_indices:
+            merged[idx] = ("baseline", 0.0)
+
+        for idx in event_indices:
+            is_dup = False
+            for existing_idx in list(merged.keys()):
+                if abs(idx - existing_idx) <= self.merge_dedup_frames:
+                    if merged[existing_idx][0] == "baseline":
+                        del merged[existing_idx]
+                        merged[idx] = ("event", event_score_map[idx])
+                    is_dup = True
+                    break
+            if not is_dup:
+                merged[idx] = ("event", event_score_map[idx])
+
+        sorted_items = sorted(merged.items(), key=lambda x: x[0])
+        m_indices = [item[0] for item in sorted_items]
+        m_tags = [item[1][0] for item in sorted_items]
+        m_scores = [item[1][1] for item in sorted_items]
+
+        return m_indices, m_tags, m_scores
+
+    # ==================== 核心接口 ====================
+
+    def process(self, video_path: str) -> PipelineResult:
+        """
+        核心接口：处理视频
+
+        Returns:
+            PipelineResult 包含：
+              - X'（合并帧流）: frames_X_prime, indices_X_prime, source_tags, merged_scores
+              - a（独立事件帧）: frames_a, indices_a, scores_a（按分数降序）
+              - X（保底帧索引）: indices_X
+        """
+        result = PipelineResult()
+        result.baseline_mode = self.baseline_mode
+
+        try:
+            # 1. 打开视频
+            cap, info = self._open_video(video_path)
+            result.video_info = info
+            logger.info(
+                f"视频: {os.path.basename(video_path)} | "
+                f"{info.total_frames}帧, {info.fps:.1f}fps, "
+                f"{info.duration_sec:.1f}s, {info.width}x{info.height}"
+            )
+
+            # 2. 保底帧 X
+            baseline_indices = self._sample_baseline(info)
+            result.indices_X = baseline_indices
+            result.baseline_frame_count = len(baseline_indices)
+
+            # 3. 事件帧 a
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            event_indices, event_scores = self._detect_events(cap, info)
+            result.event_count = len(event_indices)
+
+            # 4. 合并 → X'
+            merged_indices, source_tags, merged_scores = self._merge(
+                baseline_indices, event_indices, event_scores
+            )
+
+            # 5. 一次性读取所有需要的帧（X' ∪ a 的原始索引）
+            all_needed = set(merged_indices) | set(event_indices)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            frame_dict = self._sequential_read_frames(
+                cap, sorted(all_needed), info.total_frames
+            )
+            cap.release()
+
+            # 6. 组装 X'（按时序）
+            for idx, tag, score in zip(merged_indices, source_tags, merged_scores):
+                if idx in frame_dict:
+                    frame_rgb = cv2.cvtColor(frame_dict[idx], cv2.COLOR_BGR2RGB)
+                    result.frames_X_prime.append(frame_rgb)
+                    result.indices_X_prime.append(idx)
+                    result.source_tags.append(tag)
+                    result.merged_scores.append(score)
+
+            result.total_output_frames = len(result.frames_X_prime)
+
+            # 7. 组装独立事件帧 a（按分数降序）
+            paired = sorted(
+                zip(event_indices, event_scores),
+                key=lambda x: x[1], reverse=True
+            )
+            for idx, score in paired:
+                if idx in frame_dict:
+                    frame_rgb = cv2.cvtColor(frame_dict[idx], cv2.COLOR_BGR2RGB)
+                    result.frames_a.append(frame_rgb)
+                    result.indices_a.append(idx)
+                    result.scores_a.append(score)
+
+            logger.info(
+                f"流水线完成: X={len(baseline_indices)}, "
+                f"a={len(event_indices)}, "
+                f"X'={result.total_output_frames} | "
+                f"模式={self.baseline_mode}"
+            )
+
+        except Exception as e:
+            logger.error(f"流水线处理失败: {e}", exc_info=True)
+
+        return result
+
+
+# ===================== 工具函数 =====================
+
+def save_pipeline_result(
+    video_path: str,
+    result: PipelineResult,
+    output_dir: str,
+    draw_info: bool = True,
+    save_events_separately: bool = True,
+):
+    """
+    保存结果帧到文件夹
+
+    目录结构：
+        output_dir/
+            X_prime/          ← 合并帧流（按时序编号）
+            events/           ← 独立事件帧（按分数排序，可选）
+    """
+    if not result.indices_X_prime:
+        logger.info("没有帧需要保存")
+        return
+
+    fps = result.video_info.fps if result.video_info.fps > 0 else 25.0
+
+    # ---- 保存 X' ----
+    xp_dir = os.path.join(output_dir, "X_prime")
+    os.makedirs(xp_dir, exist_ok=True)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        logger.error(f"无法打开视频: {video_path}")
+        return
+
+    saved = 0
+    for i, (idx, tag, score) in enumerate(
+        zip(result.indices_X_prime, result.source_tags, result.merged_scores)
+    ):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        if draw_info:
+            h, w = frame.shape[:2]
+            overlay = frame.copy()
+            color = (0, 0, 180) if tag == "event" else (80, 80, 80)
+            cv2.rectangle(overlay, (0, 0), (w, 40), color, -1)
+            cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+            time_sec = idx / fps
+            text = f"[{i:03d}] F#{idx} | {tag.upper()}"
+            if tag == "event":
+                text += f" | S={score:.3f}"
+            text += f" | T={time_sec:.2f}s"
+            cv2.putText(
+                frame, text, (10, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1
+            )
+
+        prefix = f"EVENT_{score:.3f}" if tag == "event" else "BASE"
+        path = os.path.join(xp_dir, f"{i:03d}_{prefix}_f{idx:06d}.jpg")
+        cv2.imwrite(path, frame)
+        saved += 1
+
+    logger.info(f"X' 已保存 {saved} 帧到 {xp_dir}")
+
+    # ---- 保存独立事件帧 ----
+    if save_events_separately and result.indices_a:
+        ev_dir = os.path.join(output_dir, "events")
+        os.makedirs(ev_dir, exist_ok=True)
+
+        ev_saved = 0
+        for rank, (idx, score) in enumerate(
+            zip(result.indices_a, result.scores_a)
+        ):
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ret, frame = cap.read()
-            if ret:
-                output_path = os.path.join(output_dir, f"frame_{idx:05d}.jpg")
-                cv2.imwrite(output_path, frame)
-                saved_count += 1
-            else:
-                print(f"警告：无法读取索引为 {idx} 的帧。")
-        cap.release()
-        
-        if saved_count > 0:
-            print(f"成功保存 {saved_count} 帧到目录 {output_dir}")
+            if not ret:
+                continue
 
-    # 1. 初始化筛选器
-    selector = RiskFrameSelector(
-        sample_fps=10,
-        top_k=5,
-        min_gap_sec=0.1
+            if draw_info:
+                h, w = frame.shape[:2]
+                overlay = frame.copy()
+                cv2.rectangle(overlay, (0, 0), (w, 40), (0, 0, 200), -1)
+                cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+                time_sec = idx / fps
+                text = (
+                    f"EVENT #{rank+1} | F#{idx} | "
+                    f"Score={score:.3f} | T={time_sec:.2f}s"
+                )
+                cv2.putText(
+                    frame, text, (10, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1
+                )
+
+            path = os.path.join(
+                ev_dir, f"{rank:02d}_score{score:.3f}_f{idx:06d}.jpg"
+            )
+            cv2.imwrite(path, frame)
+            ev_saved += 1
+
+        logger.info(f"事件帧已保存 {ev_saved} 帧到 {ev_dir}")
+
+    cap.release()
+
+
+# ===================== 测试入口 =====================
+if __name__ == "__main__":
+    import sys
+
+    video_path = (
+        sys.argv[1] if len(sys.argv) > 1
+        else "/sda/yuqifan/HFOCUS/test/1.mp4"
     )
-    
-    # 2. 筛选高风险帧
-    video_path = "/sda/yuqifan/HFOCUS/test/2.mp4"  # 替换为你的短视频路径
+
+    # 命令行第二个参数选模式: python xxx.py video.mp4 low/high
+    mode = sys.argv[2] if len(sys.argv) > 2 else "low"
+
+    print(f"\n{'='*60}")
+    print(f"模式: {mode}")
+    print(f"{'='*60}\n")
+
+    pipeline = VideoFramePipeline(
+        baseline_mode=mode,
+        baseline_fixed_frames=40,    # low模式生效
+        baseline_fps=2.0,            # high模式生效
+        event_sample_fps=10,
+        flash_sensitivity=2.5,
+        anomaly_sensitivity=2.0,
+        event_min_gap_sec=0.03,
+        max_events=30,
+        merge_dedup_frames=2,
+    )
+
+    result = pipeline.process(video_path)
+
+    # 摘要
+    print(f"\n{'='*60}")
+    print(result.summary())
+    print(f"{'='*60}")
+
+    # X' 详情
+    if result.indices_X_prime:
+        print(f"\nX' 帧流 ({result.total_output_frames} 帧):")
+        print("-" * 55)
+        bc = sum(1 for t in result.source_tags if t == "baseline")
+        ec = sum(1 for t in result.source_tags if t == "event")
+        print(f"  构成: {bc} 保底 + {ec} 事件\n")
+
+        fps = result.video_info.fps if result.video_info.fps > 0 else 25.0
+        for i, (idx, tag, score) in enumerate(
+            zip(result.indices_X_prime, result.source_tags, result.merged_scores)
+        ):
+            t = idx / fps
+            marker = "⚡" if tag == "event" else "  "
+            sc = f"score={score:.3f}" if tag == "event" else ""
+            print(
+                f"  {marker} [{i:03d}] frame={idx:6d}  "
+                f"t={t:6.2f}s  {tag:8s}  {sc}"
+            )
+
+    # 独立事件帧
+    if result.indices_a:
+        fps = result.video_info.fps if result.video_info.fps > 0 else 25.0
+        print(f"\n事件帧 a ({result.event_count} 帧, 按分数降序):")
+        print("-" * 55)
+        for rank, (idx, score) in enumerate(
+            zip(result.indices_a, result.scores_a)
+        ):
+            t = idx / fps
+            bar = "█" * int(score * 20)
+            print(
+                f"  #{rank+1:2d}  frame={idx:6d}  t={t:6.2f}s  "
+                f"score={score:.3f}  {bar}"
+            )
+
+    # 保存
     video_name = os.path.splitext(os.path.basename(video_path))[0]
-    output_folder = os.path.join("output_frames", video_name)
-
-    high_risk_frames = selector.select(video_path)
-    
-    # 3. 输出结果
-    print(f"筛选出的高风险帧索引：{high_risk_frames}")
-
-    # 4. 保存选中的帧到文件夹
-    save_frames(video_path, high_risk_frames, output_folder)
+    output_folder = os.path.join("output_pipeline", f"{video_name}_{mode}")
+    save_pipeline_result(
+        video_path, result, output_folder,
+        draw_info=True, save_events_separately=True
+    )
