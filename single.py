@@ -289,7 +289,7 @@ class VideoFramePipeline:
         merge_dedup_frames: int = 2,
         # ===== 过滤配置 =====
         thresh_black_screen: float = 10.0,
-        thresh_blur: float = 50.0,
+        thresh_blur: float = 15.0,
     ):
         """
         Args:
@@ -689,7 +689,7 @@ if __name__ == "__main__":
 
     video_path = (
         sys.argv[1] if len(sys.argv) > 1
-        else "/sda/yuqifan/HFOCUS/test/1.mp4"
+        else "/sda/yuqifan/HFOCUS/test/2.mp4"
     )
 
     # 命令行第二个参数选模式: python xxx.py video.mp4 low/high
