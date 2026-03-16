@@ -290,6 +290,9 @@ class VideoFramePipeline:
         # ===== 过滤配置 =====
         thresh_black_screen: float = 10.0,
         thresh_blur: float = 15.0,
+        # ===== 相似帧过滤 =====
+        sim_filter_enabled: bool = True,
+        sim_filter_threshold: float = 0.97,  # 相似度阈值，越高越严格（保留更多帧）
     ):
         """
         Args:
@@ -304,6 +307,8 @@ class VideoFramePipeline:
             merge_dedup_frames: 合并去重距离（帧索引差<=此值视为重复）
             thresh_black_screen: 黑屏检测阈值
             thresh_blur: 模糊检测阈值
+            sim_filter_enabled: 是否启用相似帧过滤
+            sim_filter_threshold: 相似度阈值 0~1，超过此值视为重复（建议 0.90~0.95）
         """
         if baseline_mode not in ("low", "high"):
             raise ValueError(
@@ -317,6 +322,8 @@ class VideoFramePipeline:
         self.merge_dedup_frames = merge_dedup_frames
         self.thresh_black_screen = thresh_black_screen
         self.thresh_blur = thresh_blur
+        self.sim_filter_enabled = sim_filter_enabled
+        self.sim_filter_threshold = sim_filter_threshold
 
         self.event_detector = EventFrameDetector(
             flash_sensitivity=flash_sensitivity,
@@ -493,6 +500,63 @@ class VideoFramePipeline:
 
         return m_indices, m_tags, m_scores
 
+    # ==================== 相似帧过滤 ====================
+
+    def _filter_similar(
+        self,
+        frames: List[np.ndarray],
+        indices: List[int],
+        tags: List[str],
+        scores: List[float],
+    ) -> Tuple[List[np.ndarray], List[int], List[str], List[float]]:
+        """
+        过滤 X' 中与前一保留帧高度相似的冗余帧。
+        适用场景：稳定运动画面、静止背景段落等相邻帧几乎无变化的情况。
+
+        优先级：event 帧 > baseline 帧。
+        当当前帧(event)与已保留帧(baseline)相似时，替换掉已保留帧。
+        其余情况丢弃当前帧。
+        """
+        if len(frames) <= 1:
+            return frames, indices, tags, scores
+
+        small_size = (64, 64)
+        smalls = []
+        for f in frames:
+            gray = cv2.cvtColor(f, cv2.COLOR_RGB2GRAY)
+            smalls.append(cv2.resize(gray, small_size).astype(np.float32))
+
+        keep = [True] * len(frames)
+        last_kept = 0
+
+        for i in range(1, len(frames)):
+            diff = np.mean(np.abs(smalls[i] - smalls[last_kept])) / 255.0
+            similarity = 1.0 - diff
+
+            if similarity >= self.sim_filter_threshold:
+                # 相似：event 替换 baseline，否则丢弃当前帧
+                if tags[i] == "event" and tags[last_kept] == "baseline":
+                    keep[last_kept] = False
+                    last_kept = i
+                else:
+                    keep[i] = False
+            else:
+                last_kept = i
+
+        out_frames  = [f for f, k in zip(frames,  keep) if k]
+        out_indices = [v for v, k in zip(indices, keep) if k]
+        out_tags    = [v for v, k in zip(tags,    keep) if k]
+        out_scores  = [v for v, k in zip(scores,  keep) if k]
+
+        n_removed = keep.count(False)
+        if n_removed > 0:
+            logger.info(
+                f"相似帧过滤: 移除 {n_removed} 帧 "
+                f"(阈值={self.sim_filter_threshold:.2f}) "
+                f"→ 剩余 {len(out_frames)} 帧"
+            )
+        return out_frames, out_indices, out_tags, out_scores
+
     # ==================== 核心接口 ====================
 
     def process(self, video_path: str) -> PipelineResult:
@@ -551,6 +615,15 @@ class VideoFramePipeline:
                     result.merged_scores.append(score)
 
             result.total_output_frames = len(result.frames_X_prime)
+
+            # 6b. 相似帧过滤
+            if self.sim_filter_enabled and result.frames_X_prime:
+                (result.frames_X_prime, result.indices_X_prime,
+                 result.source_tags, result.merged_scores) = self._filter_similar(
+                    result.frames_X_prime, result.indices_X_prime,
+                    result.source_tags, result.merged_scores,
+                )
+                result.total_output_frames = len(result.frames_X_prime)
 
             # 7. 组装独立事件帧 a（按分数降序）
             paired = sorted(
@@ -689,7 +762,7 @@ if __name__ == "__main__":
 
     video_path = (
         sys.argv[1] if len(sys.argv) > 1
-        else "/sda/yuqifan/HFOCUS/test/2.mp4"
+        else "/sda/yuqifan/HFOCUS/test/1.mp4"
     )
 
     # 命令行第二个参数选模式: python xxx.py video.mp4 low/high
@@ -706,7 +779,7 @@ if __name__ == "__main__":
         event_sample_fps=10,
         flash_sensitivity=2.5,
         anomaly_sensitivity=2.0,
-        event_min_gap_sec=0.03,
+        event_min_gap_sec=0.33,
         max_events=30,
         merge_dedup_frames=2,
     )
