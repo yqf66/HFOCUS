@@ -12,12 +12,25 @@ from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcess
 from qwen_omni_utils import process_mm_info
 
 
+def _get_module_device(module: torch.nn.Module) -> torch.device | None:
+    """返回模块中第一个非-meta 参数所在设备。"""
+    try:
+        for param in module.parameters():
+            if torch.is_tensor(param) and param.device.type != "meta":
+                return param.device
+    except Exception:
+        pass
+    return None
+
+
 def run_native_video_inference(
     video_path: str,
     prompt: str,
     model_path: str = "/sda/yuqifan/HFOCUS/Qwen2.5-Omni",
     output_audio_path: str = None,
     disable_talker: bool = False,
+    device: str | None = None,
+    device_map: str | None = "auto",
 ):
     """原生视频输入推理，配置与 use_Omni.py 保持一致"""
 
@@ -26,12 +39,33 @@ def run_native_video_inference(
     print("加载模型")
     print("=" * 60)
 
+    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if device is None and n_gpu > 0:
+        device = "cuda:0"
+    elif device is None:
+        device = "cpu"
+
+    model_dtype = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
+    effective_device_map = device_map
+    model_load_kwargs = {
+        "torch_dtype": model_dtype,
+        "attn_implementation": "sdpa",
+    }
+    if effective_device_map not in (None, "none"):
+        model_load_kwargs["device_map"] = effective_device_map
+
     model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
         model_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        attn_implementation="sdpa",
+        **model_load_kwargs,
     )
+
+    if effective_device_map in (None, "none"):
+        model = model.to(device)
+        input_device = torch.device(device)
+    else:
+        thinker_embed = model.thinker.get_input_embeddings()
+        input_device = _get_module_device(thinker_embed) or torch.device(device)
+        print(f"[提示] 当前为分片推理，输入张量将放置到 {input_device}")
 
     if disable_talker:
         model.disable_talker()
@@ -50,9 +84,14 @@ def run_native_video_inference(
         {
             "role": "system",
             "content": [{"type": "text", "text": 
-                "You are Qwen, a virtual human developed by the Qwen Team, "
-                "Alibaba Group, capable of perceiving auditory and visual inputs, "
-                "as well as generating text and speech."
+                "You are a powerful multimodal assistant specialized in video understanding. "
+                "You can analyze both visual and audio information in videos, and you should always "
+                "jointly use what is seen and what is heard to understand the content. "
+                "Pay close attention to actions, objects, scenes, temporal changes, spoken language, "
+                "background sounds, tone, and other auditory cues. "
+                "Do not rely only on the visual stream when audio provides important evidence. "
+                "When answering, prioritize accuracy, ground your response in the video evidence, "
+                "and clearly reflect the role of both visual and audio information whenever relevant."
             }],
         },
         {
@@ -82,7 +121,13 @@ def run_native_video_inference(
         padding=True,
         use_audio_in_video=USE_AUDIO_IN_VIDEO,
     )
-    inputs = inputs.to(model.device).to(model.dtype)
+    for key, value in inputs.items():
+        if not torch.is_tensor(value):
+            continue
+        value = value.to(input_device)
+        if value.is_floating_point():
+            value = value.to(model_dtype)
+        inputs[key] = value
 
     print(f"视频: {video_path}")
     print(f"音频轨道: 由模型原生处理 (use_audio_in_video=True)")
@@ -98,10 +143,23 @@ def run_native_video_inference(
         )
         audio_output = None
     else:
-        text_ids, audio_output = model.generate(
-            **inputs,
-            use_audio_in_video=USE_AUDIO_IN_VIDEO,
-        )
+        try:
+            text_ids, audio_output = model.generate(
+                **inputs,
+                use_audio_in_video=USE_AUDIO_IN_VIDEO,
+            )
+        except RuntimeError as e:
+            err = str(e)
+            if "Expected all tensors to be on the same device" in err:
+                print("[警告] 多卡+Talker 触发跨卡拼接错误，自动回退为仅文本输出（保留多卡 Thinker 推理）。")
+                text_ids = model.generate(
+                    **inputs,
+                    use_audio_in_video=USE_AUDIO_IN_VIDEO,
+                    return_audio=False,
+                )
+                audio_output = None
+            else:
+                raise
 
     # ============ 输出 ============
     print("\n" + "=" * 60)
@@ -132,11 +190,19 @@ def run_native_video_inference(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Qwen2.5-Omni 原生视频推理（对照组）")
-    parser.add_argument("--video", type=str, default="/sda/yuqifan/HFOCUS/test/1.mp4")
-    parser.add_argument("--prompt", type=str, default="请分析这段视频的内容")
+    parser.add_argument("--video", type=str, default="/sda/yuqifan/HFOCUS/test/3.mp4")
+    parser.add_argument("--prompt", type=str, default="请重点分析这段视频中的音频内容，尤其是人物对话、说话顺序、关键语句、语气和情绪变化。"
+                                                      "先尽可能准确概括或转写音频中的主要对话内容，再结合视频画面判断是谁在说话、他们在做什么、"
+                                                      "场景是什么，以及画面与对话之间的关系。"
+                                                      "如果画面信息与音频信息有冲突或补充，请明确说明。"
+                                                      "回答时请优先依据音频理解视频含义，不要只根据画面做概括。")
     parser.add_argument("--model", type=str, default="/sda/yuqifan/HFOCUS/Qwen2.5-Omni")
     parser.add_argument("--output_audio", type=str, default=None)
     parser.add_argument("--disable_talker", action="store_true")
+    parser.add_argument("--device", type=str, default=None,
+                        help="运行设备，如 cuda:0 / cpu（默认自动选择）")
+    parser.add_argument("--device_map", type=str, default="auto",
+                        help="HF device_map，默认 auto（多卡分片）；设为 none 可强制单卡")
     args = parser.parse_args()
 
     run_native_video_inference(
@@ -145,4 +211,6 @@ if __name__ == "__main__":
         model_path=args.model,
         output_audio_path=args.output_audio,
         disable_talker=args.disable_talker,
+        device=args.device,
+        device_map=args.device_map,
     )

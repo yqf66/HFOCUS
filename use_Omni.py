@@ -32,6 +32,17 @@ from qwen_omni_utils import process_mm_info
 from single import VideoFramePipeline, PipelineResult
 
 
+def _get_module_device(module: torch.nn.Module) -> torch.device | None:
+    """返回模块中第一个非-meta 参数所在设备。"""
+    try:
+        for param in module.parameters():
+            if torch.is_tensor(param) and param.device.type != "meta":
+                return param.device
+    except Exception:
+        pass
+    return None
+
+
 # ===================== 音频提取 =====================
 def extract_audio_from_video(video_path: str, output_wav: str, sr: int = 16000) -> bool:
     """
@@ -170,7 +181,7 @@ def build_conversation(
         f"请结合这些标注信息理解视频的时序结构"
     )
     if audio_path and os.path.exists(audio_path):
-        frame_info += "，同时参考音频内容"
+        frame_info += "，同时参考音频内容，仔细聆听音频，描述音频中的语音内容，最后将音频和视觉信息结合"
     frame_info += f"，回答以下问题]\n\n{prompt}"
 
     user_content.append({"type": "text", "text": frame_info})
@@ -197,6 +208,8 @@ def run_inference(
     system_prompt: str | None = None,
     output_audio_path: str | None = None,
     disable_talker: bool = False,
+    device: str | None = None,
+    device_map: str | None = "auto",
     # pipeline 额外参数
     event_sample_fps: int = 10,
     flash_sensitivity: float = 2.5,
@@ -279,12 +292,37 @@ def run_inference(
     print("=" * 60)
 
     print(f"模型: {model_path}")
+    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if device is None and n_gpu > 0:
+        device = "cuda:0"
+    elif device is None:
+        device = "cpu"
+
+    model_dtype = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
+
+    # 默认保留多卡分片能力；可通过 --device_map none 强制单卡。
+    effective_device_map = device_map
+
+    model_load_kwargs = {
+        "torch_dtype": model_dtype,
+    }
+    if effective_device_map not in (None, "none"):
+        model_load_kwargs["device_map"] = effective_device_map
+
     model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
         model_path,
-        torch_dtype="auto",
-        device_map="auto",
-        # attn_implementation="flash_attention_2",  # 如需启用取消注释
+        attn_implementation="sdpa",  # PyTorch 内置 memory-efficient attention，无需 flash-attn
+        **model_load_kwargs,
     )
+
+    if effective_device_map in (None, "none"):
+        model = model.to(device)
+        input_device = torch.device(device)
+    else:
+        # 多卡分片时，输入应放在 Thinker embedding 所在设备，避免 generate 内部跨卡拼接错误
+        thinker_embed = model.thinker.get_input_embeddings()
+        input_device = _get_module_device(thinker_embed) or torch.device(device)
+        print(f"[提示] 当前为分片推理，输入张量将放置到 {input_device}")
 
     if disable_talker:
         model.disable_talker()
@@ -312,8 +350,10 @@ def run_inference(
     audios, images, videos = process_mm_info(
         conversation, use_audio_in_video=use_audio_in_video
     )
-    # max_pixels 限制每帧分辨率：28*28*256 ≈ 448×448，可按显存调整
-    # 25帧 × 1024patch × 每patch token数 → attention mask 可控
+    # max_pixels 控制每帧分辨率上限，视觉编码器对所有帧全局 attention，
+    # 总显存 ∝ (N_frames × patches_per_frame)²
+    # 28*28*64 ≈ 224×224 → 25帧×256patch=6400，Q×K ≈ 1.3GB，单卡可承受
+    # 若帧数减少可适当提高：28*28*128 ≈ 317×317
     inputs = processor(
         text=text,
         audio=audios,
@@ -322,9 +362,16 @@ def run_inference(
         return_tensors="pt",
         padding=True,
         use_audio_in_video=use_audio_in_video,
-        max_pixels=28 * 28 * 256,   # ≈ 448×448 per frame
+        max_pixels=28 * 28 * 512, 
     )
-    inputs = inputs.to(model.device).to(model.dtype)
+    # 仅将浮点张量转为模型 dtype，避免 input_ids 等整型张量被错误转换
+    for key, value in inputs.items():
+        if not torch.is_tensor(value):
+            continue
+        value = value.to(input_device)
+        if value.is_floating_point():
+            value = value.to(model_dtype)
+        inputs[key] = value
 
     print(f"输入构造完成, 开始推理...")
     print(f"  图片数: {len(images) if images else 0}")
@@ -340,10 +387,23 @@ def run_inference(
         )
         audio_output = None
     else:
-        text_ids, audio_output = model.generate(
-            **inputs,
-            use_audio_in_video=use_audio_in_video,
-        )
+        try:
+            text_ids, audio_output = model.generate(
+                **inputs,
+                use_audio_in_video=use_audio_in_video,
+            )
+        except RuntimeError as e:
+            err = str(e)
+            if "Expected all tensors to be on the same device" in err:
+                print("[警告] 多卡+Talker 触发跨卡拼接错误，自动回退为仅文本输出（保留多卡 Thinker 推理）。")
+                text_ids = model.generate(
+                    **inputs,
+                    use_audio_in_video=use_audio_in_video,
+                    return_audio=False,
+                )
+                audio_output = None
+            else:
+                raise
 
     # 解码文本
     text_output = processor.batch_decode(
@@ -381,10 +441,13 @@ def parse_args():
         description="Qwen2.5-Omni 推理（集成 VideoFramePipeline）"
     )
     # 基本参数
-    parser.add_argument("--video", type=str, default="/sda/yuqifan/HFOCUS/test/1.mp4",
+    parser.add_argument("--video", type=str, default="/sda/yuqifan/HFOCUS/test/3.mp4",
                         help="输入视频路径")
-    parser.add_argument("--prompt", type=str, default="请分析这段视频的内容",
-                        help="提问内容")
+    parser.add_argument("--prompt", type=str, default="请先重点分析音频内容，尤其是人物对话、说话顺序、关键语句、语气和情绪变化。"
+                                                      "先尽可能准确概括或转写音频中的主要对话内容，再结合视频画面判断是谁在说话、他们在做什么、"
+                                                      "场景是什么，以及画面与对话之间的关系。"
+                                                      "如果画面信息与音频信息有冲突或补充，请明确说明。"
+                                                      "回答时请优先依据音频理解视频含义，不要只根据画面做概括。", help="提问内容")
     parser.add_argument("--model", type=str, default="/sda/yuqifan/HFOCUS/Qwen2.5-Omni",
                         help="模型路径或 HuggingFace ID")
 
@@ -411,6 +474,10 @@ def parse_args():
                         help="输出语音保存路径（如 output.wav）")
     parser.add_argument("--disable_talker", action="store_true",
                         help="禁用语音生成，节省 ~2GB 显存")
+    parser.add_argument("--device", type=str, default=None,
+                        help="运行设备，如 cuda:0 / cpu（默认自动选择）")
+    parser.add_argument("--device_map", type=str, default="auto",
+                        help="HF device_map，默认 auto（多卡分片）；设为 none 可强制单卡")
 
     # 系统提示词
     parser.add_argument("--system_prompt", type=str, default=None,
@@ -432,6 +499,8 @@ if __name__ == "__main__":
         system_prompt=args.system_prompt,
         output_audio_path=args.output_audio,
         disable_talker=args.disable_talker,
+        device=args.device,
+        device_map=args.device_map,
         event_sample_fps=args.event_fps,
         flash_sensitivity=args.flash_sens,
         anomaly_sensitivity=args.anomaly_sens,
