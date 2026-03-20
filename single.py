@@ -12,7 +12,8 @@
 
 输出：
     result.frames_X_prime / indices_X_prime  → 合并后的完整视频流 X'
-    result.frames_a / indices_a / scores_a   → 单独的事件帧集合 a
+    result.event_windows                      → 事件时间窗（核心输出）
+    result.frames_a / indices_a / scores_a   → 兼容输出：高异常候选帧集合 a
 
 使用方式：
     from video_frame_pipeline import VideoFramePipeline
@@ -83,6 +84,12 @@ class PipelineResult:
     indices_a: List[int] = field(default_factory=list)
     scores_a: List[float] = field(default_factory=list)
 
+    # ===== 事件时间窗（核心输出）=====
+    event_windows: List["EventWindow"] = field(default_factory=list)
+    window_count: int = 0
+    window_peak_indices: List[int] = field(default_factory=list)
+    window_dense_index_dict: Dict[int, List[int]] = field(default_factory=dict)
+
     # ===== 保底帧 X（仅保底帧）=====
     indices_X: List[int] = field(default_factory=list)
 
@@ -90,7 +97,7 @@ class PipelineResult:
     video_info: VideoInfo = field(default_factory=VideoInfo)
     baseline_mode: str = ""               # "low" / "high"
     baseline_frame_count: int = 0         # 保底帧数量
-    event_count: int = 0                  # 事件帧数量
+    event_count: int = 0                  # 兼容字段：高异常候选帧数量
     total_output_frames: int = 0          # X' 总帧数
 
     def summary(self) -> str:
@@ -106,16 +113,50 @@ class PipelineResult:
             f"总帧数: {self.video_info.total_frames}",
             f"模式: {self.baseline_mode} ({mode_desc})",
             f"保底帧(X): {self.baseline_frame_count} 帧",
-            f"事件帧(a): {self.event_count} 帧",
+            f"事件时间窗: {self.window_count} 个",
+            f"高异常候选帧(a): {self.event_count} 帧",
             f"合并帧(X'): {self.total_output_frames} 帧",
         ]
-        if self.scores_a:
+        if self.event_windows:
+            durations = [w.end_time - w.start_time for w in self.event_windows]
+            peak_scores = [w.peak_score for w in self.event_windows]
+            lines.append(
+                f"窗口时长(秒): avg={np.mean(durations):.3f}, "
+                f"min={min(durations):.3f}, max={max(durations):.3f}"
+            )
+            lines.append(
+                f"峰值分数: max={max(peak_scores):.3f}, "
+                f"min={min(peak_scores):.3f}, avg={np.mean(peak_scores):.3f}"
+            )
+            for w in self.event_windows:
+                lines.append(
+                    f"  - W{w.window_id:02d} "
+                    f"F[{w.start_frame}-{w.end_frame}] "
+                    f"T[{w.start_time:.2f}-{w.end_time:.2f}]s "
+                    f"peak=F{w.peak_frame}({w.peak_score:.3f}) "
+                    f"dense={len(w.dense_indices)}"
+                )
+        elif self.scores_a:
             lines.append(
                 f"事件帧分数: max={max(self.scores_a):.3f}, "
                 f"min={min(self.scores_a):.3f}, "
                 f"avg={np.mean(self.scores_a):.3f}"
             )
         return "\n".join(lines)
+
+
+@dataclass
+class EventWindow:
+    """异常事件时间窗"""
+    window_id: int
+    start_frame: int
+    end_frame: int
+    start_time: float
+    end_time: float
+    peak_frame: int
+    peak_score: float
+    dense_indices: List[int] = field(default_factory=list)
+    dense_scores: List[float] = field(default_factory=list)
 
 
 # ===================== 事件帧检测器 =====================
@@ -186,8 +227,8 @@ class EventFrameDetector:
         self, grays: List[np.ndarray], indices: List[int], fps: float
     ) -> Tuple[List[int], List[float]]:
         """
-        检测事件帧
-        Returns: (event_indices, event_scores) 按分数降序排列
+        检测高异常候选帧（不做最小间距稀疏化）
+        Returns: (candidate_indices, candidate_scores) 按时间升序排列
         """
         n = len(grays)
         if n < 3:
@@ -245,21 +286,12 @@ class EventFrameDetector:
             (indices[i], float(anomaly_norm[i]))
             for i in range(n) if anomaly_norm[i] > 0
         ]
-        candidates.sort(key=lambda x: x[1], reverse=True)
+        candidates.sort(key=lambda x: x[0])
 
-        # 带最小间隔的选择
-        min_gap_frames = max(1, int(fps * self.min_gap_sec))
-        selected_indices = []
-        selected_scores = []
-
-        for idx, score in candidates:
-            if len(selected_indices) >= self.max_events:
-                break
-            if all(abs(idx - s) >= min_gap_frames for s in selected_indices):
-                selected_indices.append(idx)
-                selected_scores.append(score)
-
-        return selected_indices, selected_scores
+        # 兼容保留参数：min_gap_sec / max_events 不再用于最终候选筛选
+        candidate_indices = [x[0] for x in candidates]
+        candidate_scores = [x[1] for x in candidates]
+        return candidate_indices, candidate_scores
 
 
 # ===================== 主流水线 =====================
@@ -280,11 +312,14 @@ class VideoFramePipeline:
         baseline_fixed_frames: int = 40,   # low模式：固定采样帧数
         baseline_fps: float = 2.0,         # high模式：每秒采样帧数
         # ===== 事件检测配置 =====
-        event_sample_fps: int = 10,
-        flash_sensitivity: float = 2.5,
-        anomaly_sensitivity: float = 2.0,
+        event_sample_fps: int = 15,
+        flash_sensitivity: float = 2.2,
+        anomaly_sensitivity: float = 1.6,
         event_min_gap_sec: float = 0.03,
         max_events: int = 30,
+        window_merge_gap_sec: float = 0.5,
+        window_pad_sec: float = 0.1,
+        window_fuse_gap_sec: float = 0.3,
         # ===== 合并配置 =====
         merge_dedup_frames: int = 2,
         # ===== 过滤配置 =====
@@ -302,8 +337,11 @@ class VideoFramePipeline:
             event_sample_fps: 事件检测的密集采样帧率
             flash_sensitivity: 闪帧检测灵敏度
             anomaly_sensitivity: 一般异常检测灵敏度
-            event_min_gap_sec: 事件帧最小时间间隔
-            max_events: 单视频最多事件帧数
+            event_min_gap_sec: 兼容参数，默认不用于最终候选筛选
+            max_events: 兼容参数，默认不用于最终候选筛选
+            window_merge_gap_sec: 候选帧成窗的最大间隔（秒）
+            window_pad_sec: 窗口边界前后扩展（秒）
+            window_fuse_gap_sec: 二次并窗阈值（基于窗口边界间隔，秒）
             merge_dedup_frames: 合并去重距离（帧索引差<=此值视为重复）
             thresh_black_screen: 黑屏检测阈值
             thresh_blur: 模糊检测阈值
@@ -319,6 +357,9 @@ class VideoFramePipeline:
         self.baseline_fixed_frames = baseline_fixed_frames
         self.baseline_fps = baseline_fps
         self.event_sample_fps = event_sample_fps
+        self.window_merge_gap_sec = window_merge_gap_sec
+        self.window_pad_sec = window_pad_sec
+        self.window_fuse_gap_sec = window_fuse_gap_sec
         self.merge_dedup_frames = merge_dedup_frames
         self.thresh_black_screen = thresh_black_screen
         self.thresh_blur = thresh_blur
@@ -422,7 +463,7 @@ class VideoFramePipeline:
     def _detect_events(
         self, cap: cv2.VideoCapture, info: VideoInfo,
     ) -> Tuple[List[int], List[float]]:
-        """密集采样 → 过滤 → 事件检测"""
+        """密集采样 → 过滤 → 高异常候选帧检测"""
         interval = max(1, int(info.fps / self.event_sample_fps))
         dense_indices = list(range(0, info.total_frames, interval))
 
@@ -455,11 +496,131 @@ class VideoFramePipeline:
         if len(valid_indices) < 3:
             return [], []
 
-        event_indices, event_scores = self.event_detector.detect(
+        candidate_indices, candidate_scores = self.event_detector.detect(
             valid_grays, valid_indices, info.fps
         )
-        logger.info(f"检测到事件帧: {len(event_indices)} 个")
-        return event_indices, event_scores
+        logger.info(f"检测到高异常候选帧: {len(candidate_indices)} 个")
+        return candidate_indices, candidate_scores
+
+    def _build_event_windows(
+        self,
+        candidate_indices: List[int],
+        candidate_scores: List[float],
+        fps: float,
+        total_frames: int,
+    ) -> List[EventWindow]:
+        """
+        将按时间排序的高异常候选帧聚合为事件时间窗。
+        相邻候选帧间隔 <= window_merge_gap_sec 归入同一窗口。
+        """
+        if not candidate_indices:
+            return []
+
+        merge_gap_frames = max(1, int(round(self.window_merge_gap_sec * fps)))
+        pad_frames = max(0, int(round(self.window_pad_sec * fps)))
+        max_frame_idx = max(0, total_frames - 1)
+
+        grouped: List[List[Tuple[int, float]]] = []
+        cur_group: List[Tuple[int, float]] = [
+            (candidate_indices[0], candidate_scores[0])
+        ]
+
+        for idx, score in zip(candidate_indices[1:], candidate_scores[1:]):
+            if idx - cur_group[-1][0] <= merge_gap_frames:
+                cur_group.append((idx, score))
+            else:
+                grouped.append(cur_group)
+                cur_group = [(idx, score)]
+        grouped.append(cur_group)
+
+        windows: List[EventWindow] = []
+        for wid, group in enumerate(grouped):
+            dense_indices = [int(i) for i, _ in group]
+            dense_scores = [float(s) for _, s in group]
+
+            start_raw = min(dense_indices)
+            end_raw = max(dense_indices)
+            start_frame = max(0, start_raw - pad_frames)
+            end_frame = min(max_frame_idx, end_raw + pad_frames)
+
+            peak_local_idx = int(np.argmax(np.asarray(dense_scores)))
+            peak_frame = dense_indices[peak_local_idx]
+            peak_score = dense_scores[peak_local_idx]
+
+            windows.append(EventWindow(
+                window_id=wid,
+                start_frame=start_frame,
+                end_frame=end_frame,
+                start_time=start_frame / fps,
+                end_time=end_frame / fps,
+                peak_frame=peak_frame,
+                peak_score=peak_score,
+                dense_indices=dense_indices,
+                dense_scores=dense_scores,
+            ))
+
+        return windows
+
+    def _fuse_event_windows(
+        self,
+        windows: List[EventWindow],
+        fps: float,
+    ) -> List[EventWindow]:
+        """
+        二次并窗：若相邻窗口边界间隔很小，则合并为同一事件窗。
+        条件：next.start_time - cur.end_time <= window_fuse_gap_sec
+        """
+        if len(windows) <= 1:
+            return windows
+
+        if fps <= 0:
+            fps = 25.0
+        merged_groups: List[List[EventWindow]] = []
+        cur_group: List[EventWindow] = [windows[0]]
+
+        for w in windows[1:]:
+            prev = cur_group[-1]
+            # 直接按窗口时间边界判定，和 event_windows.txt 的时间语义一致
+            gap_sec = w.start_time - prev.end_time
+            if gap_sec <= self.window_fuse_gap_sec:
+                cur_group.append(w)
+            else:
+                merged_groups.append(cur_group)
+                cur_group = [w]
+        merged_groups.append(cur_group)
+
+        fused: List[EventWindow] = []
+        for wid, group in enumerate(merged_groups):
+            start_frame = min(w.start_frame for w in group)
+            end_frame = max(w.end_frame for w in group)
+
+            dense_indices: List[int] = []
+            dense_scores: List[float] = []
+            for w in group:
+                dense_indices.extend(w.dense_indices)
+                dense_scores.extend(w.dense_scores)
+
+            pairs = sorted(zip(dense_indices, dense_scores), key=lambda x: x[0])
+            dense_indices = [int(p[0]) for p in pairs]
+            dense_scores = [float(p[1]) for p in pairs]
+
+            peak_local_idx = int(np.argmax(np.asarray(dense_scores)))
+            peak_frame = dense_indices[peak_local_idx]
+            peak_score = dense_scores[peak_local_idx]
+
+            fused.append(EventWindow(
+                window_id=wid,
+                start_frame=start_frame,
+                end_frame=end_frame,
+                start_time=start_frame / fps,
+                end_time=end_frame / fps,
+                peak_frame=peak_frame,
+                peak_score=peak_score,
+                dense_indices=dense_indices,
+                dense_scores=dense_scores,
+            ))
+
+        return fused
 
     # ==================== 合并 X + a → X' ====================
 
@@ -566,7 +727,8 @@ class VideoFramePipeline:
         Returns:
             PipelineResult 包含：
               - X'（合并帧流）: frames_X_prime, indices_X_prime, source_tags, merged_scores
-              - a（独立事件帧）: frames_a, indices_a, scores_a（按分数降序）
+              - a（兼容字段）: frames_a, indices_a, scores_a（高异常候选帧，按分数降序）
+              - event_windows: 事件时间窗（核心输出）
               - X（保底帧索引）: indices_X
         """
         result = PipelineResult()
@@ -587,18 +749,40 @@ class VideoFramePipeline:
             result.indices_X = baseline_indices
             result.baseline_frame_count = len(baseline_indices)
 
-            # 3. 事件帧 a
+            # 3. 候选异常帧 -> 事件时间窗
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            event_indices, event_scores = self._detect_events(cap, info)
-            result.event_count = len(event_indices)
+            candidate_indices, candidate_scores = self._detect_events(cap, info)
+            raw_windows = self._build_event_windows(
+                candidate_indices=candidate_indices,
+                candidate_scores=candidate_scores,
+                fps=info.fps,
+                total_frames=info.total_frames,
+            )
+            result.event_windows = self._fuse_event_windows(raw_windows, info.fps)
+            if len(raw_windows) != len(result.event_windows):
+                logger.info(
+                    f"二次并窗: {len(raw_windows)} -> {len(result.event_windows)} "
+                    f"(fuse_gap={self.window_fuse_gap_sec:.2f}s)"
+                )
+            result.window_count = len(result.event_windows)
+            result.window_peak_indices = [w.peak_frame for w in result.event_windows]
+            result.window_dense_index_dict = {
+                w.window_id: list(w.dense_indices) for w in result.event_windows
+            }
+
+            # merge 输入：每个窗口取峰值帧作为代表
+            event_indices = [w.peak_frame for w in result.event_windows]
+            event_scores = [w.peak_score for w in result.event_windows]
+            # 兼容旧输出 a：保留全部高异常候选帧
+            result.event_count = len(candidate_indices)
 
             # 4. 合并 → X'
             merged_indices, source_tags, merged_scores = self._merge(
                 baseline_indices, event_indices, event_scores
             )
 
-            # 5. 一次性读取所有需要的帧（X' ∪ a 的原始索引）
-            all_needed = set(merged_indices) | set(event_indices)
+            # 5. 一次性读取所有需要的帧（X' ∪ a候选 的原始索引）
+            all_needed = set(merged_indices) | set(candidate_indices)
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             frame_dict = self._sequential_read_frames(
                 cap, sorted(all_needed), info.total_frames
@@ -625,9 +809,9 @@ class VideoFramePipeline:
                 )
                 result.total_output_frames = len(result.frames_X_prime)
 
-            # 7. 组装独立事件帧 a（按分数降序）
+            # 7. 组装独立事件帧 a（候选帧，按分数降序）
             paired = sorted(
-                zip(event_indices, event_scores),
+                zip(candidate_indices, candidate_scores),
                 key=lambda x: x[1], reverse=True
             )
             for idx, score in paired:
@@ -639,7 +823,9 @@ class VideoFramePipeline:
 
             logger.info(
                 f"流水线完成: X={len(baseline_indices)}, "
-                f"a={len(event_indices)}, "
+                f"windows={result.window_count}, "
+                f"a(candidates)={len(candidate_indices)}, "
+                f"merge_peaks={len(event_indices)}, "
                 f"X'={result.total_output_frames} | "
                 f"模式={self.baseline_mode}"
             )
@@ -658,6 +844,7 @@ def save_pipeline_result(
     output_dir: str,
     draw_info: bool = True,
     save_events_separately: bool = True,
+    save_events_by_window: bool = True,
 ):
     """
     保存结果帧到文件夹
@@ -666,11 +853,8 @@ def save_pipeline_result(
         output_dir/
             X_prime/          ← 合并帧流（按时序编号）
             events/           ← 独立事件帧（按分数排序，可选）
+            events_by_window/ ← 每个事件窗的候选帧集合（可选）
     """
-    if not result.indices_X_prime:
-        logger.info("没有帧需要保存")
-        return
-
     fps = result.video_info.fps if result.video_info.fps > 0 else 25.0
 
     # ---- 保存 X' ----
@@ -682,40 +866,43 @@ def save_pipeline_result(
         logger.error(f"无法打开视频: {video_path}")
         return
 
-    saved = 0
-    for i, (idx, tag, score) in enumerate(
-        zip(result.indices_X_prime, result.source_tags, result.merged_scores)
-    ):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        if not ret:
-            continue
+    if not result.indices_X_prime:
+        logger.info("X' 没有帧需要保存")
+    else:
+        saved = 0
+        for i, (idx, tag, score) in enumerate(
+            zip(result.indices_X_prime, result.source_tags, result.merged_scores)
+        ):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if not ret:
+                continue
 
-        if draw_info:
-            h, w = frame.shape[:2]
-            overlay = frame.copy()
-            color = (0, 0, 180) if tag == "event" else (80, 80, 80)
-            cv2.rectangle(overlay, (0, 0), (w, 40), color, -1)
-            cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+            if draw_info:
+                h, w = frame.shape[:2]
+                overlay = frame.copy()
+                color = (0, 0, 180) if tag == "event" else (80, 80, 80)
+                cv2.rectangle(overlay, (0, 0), (w, 40), color, -1)
+                cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
 
-            time_sec = idx / fps
-            text = f"[{i:03d}] F#{idx} | {tag.upper()}"
-            if tag == "event":
-                text += f" | S={score:.3f}"
-            text += f" | T={time_sec:.2f}s"
-            cv2.putText(
-                frame, text, (10, 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1
-            )
+                time_sec = idx / fps
+                text = f"[{i:03d}] F#{idx} | {tag.upper()}"
+                if tag == "event":
+                    text += f" | S={score:.3f}"
+                text += f" | T={time_sec:.2f}s"
+                cv2.putText(
+                    frame, text, (10, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1
+                )
 
-        prefix = f"EVENT_{score:.3f}" if tag == "event" else "BASE"
-        path = os.path.join(xp_dir, f"{i:03d}_{prefix}_f{idx:06d}.jpg")
-        cv2.imwrite(path, frame)
-        saved += 1
+            prefix = f"EVENT_{score:.3f}" if tag == "event" else "BASE"
+            path = os.path.join(xp_dir, f"{i:03d}_{prefix}_f{idx:06d}.jpg")
+            cv2.imwrite(path, frame)
+            saved += 1
 
-    logger.info(f"X' 已保存 {saved} 帧到 {xp_dir}")
+        logger.info(f"X' 已保存 {saved} 帧到 {xp_dir}")
 
-    # ---- 保存独立事件帧 ----
+    # ---- 保存独立事件帧（兼容：高异常候选帧） ----
     if save_events_separately and result.indices_a:
         ev_dir = os.path.join(output_dir, "events")
         os.makedirs(ev_dir, exist_ok=True)
@@ -751,7 +938,88 @@ def save_pipeline_result(
             cv2.imwrite(path, frame)
             ev_saved += 1
 
-        logger.info(f"事件帧已保存 {ev_saved} 帧到 {ev_dir}")
+        logger.info(f"高异常候选帧已保存 {ev_saved} 帧到 {ev_dir}")
+
+    # ---- 按事件窗保存候选帧 ----
+    if save_events_by_window and result.event_windows:
+        wb_dir = os.path.join(output_dir, "events_by_window")
+        os.makedirs(wb_dir, exist_ok=True)
+
+        for w in result.event_windows:
+            sub = (
+                f"W{w.window_id:02d}_"
+                f"f{w.start_frame:06d}-{w.end_frame:06d}_"
+                f"t{w.start_time:.2f}-{w.end_time:.2f}s"
+            )
+            win_dir = os.path.join(wb_dir, sub)
+            os.makedirs(win_dir, exist_ok=True)
+
+            saved_in_win = 0
+            dense_pairs = list(zip(w.dense_indices, w.dense_scores))
+            dense_pairs.sort(key=lambda x: x[0])
+            for j, (idx, score) in enumerate(dense_pairs):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+
+                if draw_info:
+                    h, w0 = frame.shape[:2]
+                    overlay = frame.copy()
+                    cv2.rectangle(overlay, (0, 0), (w0, 54), (0, 60, 200), -1)
+                    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+                    time_sec = idx / fps
+                    line1 = (
+                        f"W{w.window_id:02d} | F#{idx} | T={time_sec:.2f}s"
+                    )
+                    line2 = (
+                        f"score={score:.3f} | peak=F{w.peak_frame}"
+                    )
+                    cv2.putText(
+                        frame, line1, (10, 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1
+                    )
+                    cv2.putText(
+                        frame, line2, (10, 46),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1
+                    )
+
+                mark = "PEAK" if idx == w.peak_frame else "DENSE"
+                path = os.path.join(
+                    win_dir,
+                    f"{j:03d}_{mark}_score{score:.3f}_f{idx:06d}.jpg"
+                )
+                cv2.imwrite(path, frame)
+                saved_in_win += 1
+
+            logger.info(
+                f"事件窗 W{w.window_id:02d} 候选帧已保存 {saved_in_win} 帧到 {win_dir}"
+            )
+
+    # ---- 保存事件时间窗摘要 ----
+    if result.event_windows:
+        windows_txt = os.path.join(output_dir, "event_windows.txt")
+        with open(windows_txt, "w", encoding="utf-8") as f:
+            f.write("Event Windows\n")
+            f.write("=" * 60 + "\n")
+            for w in result.event_windows:
+                line = (
+                    f"W{w.window_id:02d} | "
+                    f"frame=[{w.start_frame}, {w.end_frame}] | "
+                    f"time=[{w.start_time:.3f}, {w.end_time:.3f}]s | "
+                    f"peak=F{w.peak_frame} ({w.peak_score:.3f}) | "
+                    f"dense={len(w.dense_indices)}\n"
+                )
+                f.write(line)
+                logger.info(
+                    f"事件窗 W{w.window_id:02d}: "
+                    f"F[{w.start_frame}-{w.end_frame}] "
+                    f"T[{w.start_time:.2f}-{w.end_time:.2f}]s "
+                    f"peak=F{w.peak_frame}({w.peak_score:.3f}) "
+                    f"dense={len(w.dense_indices)}"
+                )
+        logger.info(f"事件时间窗摘要已保存到 {windows_txt}")
 
     cap.release()
 
@@ -776,11 +1044,14 @@ if __name__ == "__main__":
         baseline_mode=mode,
         baseline_fixed_frames=40,    # low模式生效
         baseline_fps=2.0,            # high模式生效
-        event_sample_fps=10,
-        flash_sensitivity=2.5,
-        anomaly_sensitivity=2.0,
+        event_sample_fps=15,
+        flash_sensitivity=2.2,
+        anomaly_sensitivity=1.6,
         event_min_gap_sec=0.33,
         max_events=30,
+        window_merge_gap_sec=0.5,
+        window_pad_sec=0.3,
+        window_fuse_gap_sec=0.3,
         merge_dedup_frames=2,
     )
 
@@ -790,6 +1061,19 @@ if __name__ == "__main__":
     print(f"\n{'='*60}")
     print(result.summary())
     print(f"{'='*60}")
+
+    # 事件时间窗详情（核心输出）
+    if result.event_windows:
+        print(f"\n事件时间窗 ({result.window_count} 个):")
+        print("-" * 75)
+        for w in result.event_windows:
+            print(
+                f"  W{w.window_id:02d} | "
+                f"start/end frame=({w.start_frame}, {w.end_frame}) | "
+                f"start/end time=({w.start_time:.2f}s, {w.end_time:.2f}s) | "
+                f"peak frame={w.peak_frame} | peak score={w.peak_score:.3f} | "
+                f"dense count={len(w.dense_indices)}"
+            )
 
     # X' 详情
     if result.indices_X_prime:
@@ -811,10 +1095,10 @@ if __name__ == "__main__":
                 f"t={t:6.2f}s  {tag:8s}  {sc}"
             )
 
-    # 独立事件帧
+    # 独立事件帧（兼容字段：高异常候选帧）
     if result.indices_a:
         fps = result.video_info.fps if result.video_info.fps > 0 else 25.0
-        print(f"\n事件帧 a ({result.event_count} 帧, 按分数降序):")
+        print(f"\n高异常候选帧 a ({result.event_count} 帧, 按分数降序):")
         print("-" * 55)
         for rank, (idx, score) in enumerate(
             zip(result.indices_a, result.scores_a)
@@ -831,5 +1115,7 @@ if __name__ == "__main__":
     output_folder = os.path.join("output_pipeline", f"{video_name}_{mode}")
     save_pipeline_result(
         video_path, result, output_folder,
-        draw_info=True, save_events_separately=True
+        draw_info=True,
+        save_events_separately=True,
+        save_events_by_window=True,
     )
