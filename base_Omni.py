@@ -1,16 +1,14 @@
 """
 Qwen2.5-Omni 模块 A：全局视频理解（原生视频 + 音频）
 用途：输入原生视频，输出自然语言全局理解报告（非 JSON）
-并可选衔接模块 C：Query 提炼（文本小模型）+ ASR 证据补充
+并可选衔接模块 C：Query 提炼（文本小模型）
 """
 
 import argparse
 import json
 import re
-import shutil
 import subprocess
-import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -22,57 +20,65 @@ from transformers import (
     AutoTokenizer,
     Qwen2_5OmniForConditionalGeneration,
     Qwen2_5OmniProcessor,
-    pipeline,
 )
 from qwen_omni_utils import process_mm_info
+from query_utils import coalesce_query_value, extract_query_list, normalize_query_type, to_bool
 
 
 MAX_RETRIEVAL_QUERIES = 5
 
 
-GLOBAL_UNDERSTANDING_PROMPT = """You are a multimodal video evidence analyst.
+GLOBAL_UNDERSTANDING_PROMPT = """
+You are a multimodal video evidence analyst.
 
 Watch the video and produce a structured global understanding report
 optimized for downstream evidence retrieval and verification.
 
 Do NOT output JSON. Follow the exact format below strictly, as it will be parsed by later modules.
 
-===================== 
-Key Requirements: 
+=====================
+Key Requirements:
 =====================
 
 1. Use both visual and audio evidence jointly.
 2. Separate observation and interpretation strictly:
    - Use [Observed] for direct evidence
    - Use [Inferred] for interpretation
-3. Assign each key event an Event ID: (E1, E2, E3...)
+3. Assign each key visual event an Event ID: E1, E2, E3...
 4. Unclear points MUST explicitly reference related Event IDs.
-5. Audio must be analyzed across the full timeline, not only sparse moments.
-6. Do NOT treat on-screen text as spoken audio unless it is actually heard. 
-7. If speech is unclear, explicitly mark [unclear]. 
-8. Do NOT force ASR from background music/noise.
-9. Do NOT use exact timestamps.
-10. Use only coarse temporal phase hints such as:
-   - beginning
-   - early-middle
-   - middle
-   - late-middle
-   - ending
-   - transition
-11. Each key visual event must have an Event ID: E1, E2, E3...
-12. Focus on making the output useful for: 
-   - later frame retrieval 
-   - evidence verification
+5. Do NOT output timestamps or phase labels anywhere.
 
+6. [CRITICAL AUDIO-VISUAL FIREWALL]: Do NOT treat on-screen text (OCR) as spoken audio (ASR).
+   - If text is printed on screen but not audibly spoken by a real voice, it MUST NOT appear in the [Speech Transcript] section.
+   - Do NOT use visual context to guess missing spoken words.
 
-===================== 
-Output Format: 
+7. [MANDATORY ENTITY EXTRACTION]: You must actively scan for and explicitly document high-value visual entities across various domains. Pay special attention to:
+   - National, regional, or international flags and emblems.
+   - Religious, ideological, or organizational symbols and insignias.
+   - Political logos, campaign merchandise, protest signs, or distinct uniform patches.
+   - Recognizable public figures, leader lookalikes, impersonations, parodies, or heavy imitation makeup/costume.
+   - [UNKNOWN SALIENT FIGURES]: If a person appears to imitate or resemble a real public figure, BUT you cannot identify them confidently, label them as [Unidentified Key Figure] and describe their distinctive face, hair, costume, and accessories.
+   - If identity or symbol significance is uncertain but potentially important, still report it neutrally rather than omitting it.
+
+8. Very important for speech transcription:
+   - Transcribe as much spoken wording as you can across the whole video.
+   - Prioritize fuller transcription over short fragments when the speech is reasonably audible.
+   - Do NOT paraphrase speech.
+   - Do NOT summarize speech inside the transcript section.
+   - Do NOT infer missing words from visual context.
+   - Do NOT use speaker labels or speaker attribution.
+   - If a few words are uncertain, omit only those words and keep the surrounding audible words.
+   - Use `none reliable` only if there is truly no usable spoken content in the video.
+
+=====================
+Output Format:
 =====================
 
 [Scene]
 - setting: ...
 - people: ...
 - roles: ...
+- high-value entities: [List any visible flags, logos, patches, symbols, slogans, salutes, portraits, or recognizable / possibly recognizable figures based on Requirement 7. For each item, include a short category tag such as [symbol], [identity-candidate], [organization], [slogan], [unknown], plus a neutral visible description. Write "None" if none are observed]
 - context: ...
 
 [Full Video Narrative]
@@ -81,45 +87,43 @@ Output Format:
 
 [Observed Visual Events]
 
-E1 [phase]:
+E1:
 - [Observed] ...
 
-E2 [phase]:
+E2:
 - [Observed] ...
 
-E3 [phase]:
+E3:
 - [Observed] ...
 
-[Full Audio Track Analysis]
-- one concise paragraph summarizing speech presence, tone/emotion, background sound changes, and silence/noise periods
-- cover beginning, middle, and ending
-- do not fabricate exact wording if unclear
-
-[ASR Transcript] 
-- provide speech transcription from heard audio only (NO timestamps) 
-- if speaker identity is unclear, label as Speaker-Unknown - if words are unclear, mark them as [unclear] 
-- do NOT use on-screen text unless it is actually spoken in audio
+[Speech Transcript]
+- "..."
+- "..."
+- include spoken wording only
+- do NOT add speaker labels
+- do NOT add timestamps
+- do NOT paraphrase
+- if a short part is uncertain, omit only that small part and keep the rest
+- if no reliable speech is audible anywhere, write: none reliable
 
 [Main Interpretation]
 - [Inferred] the most likely explanation of what is happening
 
 [Alternative Interpretation]
-- [Inferred] provide a second plausible explanation from another angle，this is mandatory 
+- [Inferred] provide a second plausible explanation from another angle
 
 [Key Unclear Points]
 
 U1 (related to E2):
 - what is unclear:
-- why it is unclear:
 - what needs verification:
 
 U2 (related to E3):
 - what is unclear:
-- why it is unclear:
 - what needs verification:
 
 [Preliminary Conclusion]
-- cautious summary
+- [Inferred] cautious summary
 - confidence: low / medium / high
 """
 
@@ -130,165 +134,202 @@ Input:
 A natural-language global video understanding report written by a multimodal model.
 
 Your task:
-Extract 1 to 5 high-value queries for downstream evidence verification.
-
-These queries will be routed to downstream video-internal retrieval modules according to query_type:
-- ASR: retrieve spoken words, narration, tone, or sound cues from the video's audio track
-- OCR: retrieve on-screen text from the video
-- Visual: retrieve visual evidence such as people, objects, symbols, actions, gestures, clothing, patches, flags, or scenes
-- Mixed: retrieve evidence that clearly requires multiple video-internal sources together
-
-For each query, you must also decide whether the retrieved evidence may require external background checking.
-This is not a separate query type.
-Instead, use:
-- needs_external_check: true / false
-- external_check_focus
-- external_check_hint
-
-External checking is for cases where a retrieved person, symbol, slogan, phrase, gesture, organization, historical reference, or other marker may have important meaning beyond what is directly observable in the video.
-
-Do NOT invent any new fact.
-Only use information explicitly present in the report.
+Extract 1 to 5 high-value queries for downstream evidence verification. Output JSON ONLY.
+Each query should be easy for a retrieval system to route to the correct segment.
 
 =====================
-Core Rules
+[CRITICAL] Downstream Architecture Constraint & Doubt Translation
 =====================
+The downstream retrieval module uses Text-to-Image similarity FIRST to find the relevant video segment, then applies ASR/OCR if needed.
+THEREFORE, EVERY QUERY (including ASR and OCR) MUST CONTAIN STRONG VISUAL ANCHORS.
 
-1. Prioritize evidence gaps explicitly listed in [Key Unclear Points].
-2. If [Key Unclear Points] is missing or weak, use ambiguity from [Alternative Interpretation], [Main Interpretation], [Observed Visual Events], [Full Audio Track Analysis], or [ASR Transcript].
-3. Prefer fewer but more important queries.
-4. If the report is already clear enough, output an empty list.
-5. Each query must be concrete, short, and retrieval-friendly.
-6. Do NOT output broad video-level interpretation queries.
-7. Do NOT ask abstract questions about the whole video's ideology, message, motive, or intent.
-8. Do NOT invent identities, symbols, or meanings that are not explicitly supported by the report.
-9. query_type only describes the main video-internal retrieval route. It does NOT describe whether external checking is needed.
-10. needs_external_check can be true for any query_type: ASR, OCR, Visual, or Mixed.
+Furthermore, you must TRANSLATE ABSTRACT DOUBTS INTO VISIBLE TESTS. Do not query invisible motives; query the visible evidence that proves them.
+- Bad Doubt Query: "is the interaction hostile or friendly" (Abstract, invisible).
+- Good Doubt Query: "facial expressions and body posture during the close interaction" (Visible test for hostility).
+- Bad ASR Query: "what is being said" (No visual anchor).
+- Good ASR Query: "spoken words during podium scene with person in bright jacket" (Visual anchor allows segment retrieval).
+
+When converting doubts into queries, think in this order:
+1. What is the exact doubt?
+2. What visible/audio evidence would resolve it?
+3. What short retrieval phrase would most reliably find that evidence?
+
+=====================
+[MANDATORY] Prioritization: Targeting the "Critical Unknowns"
+=====================
+1. RESOLVE THE AMBIGUITY (Top Priority): Your primary objective is to verify the video's core discrepancies. You MUST prioritize generating queries that target:
+   - Specific gaps listed in the report's `[Key Unclear Points]`.
+   - The exact moments where the `[Alternative Interpretation]` forks from the `[Main Interpretation]`.
+   - Contradictions (e.g., aggressive gestures but calm audio).
+2. HIGH-VALUE TARGETS: You MUST create queries targeting any items listed in the report's "high-value entities" (e.g., specific flags, patches, symbols, parodies of leaders). Do not ignore them.
+3. ASR QUERIES SHOULD FOLLOW THE TRANSCRIPT: If the report contains spoken wording, generate ASR queries that help retrieve the scene for that wording. Do not depend on speaker attribution.
+4. EXTERNAL-CHECK CANDIDATES: If the report describes a potentially meaningful identity, impersonation, parody, symbol, slogan, patch, logo, organization, salute, or historical reference, prefer a neutral retrieval query plus `needs_external_check=true`.
+5. MERGE OVERLAPS: Do not output multiple queries targeting the same visual event, text, or scene. Combine them into one comprehensive query.
+
+=====================
+[CRITICAL] External Check Hard Threshold (DEFAULT: FALSE)
+=====================
+By default, `needs_external_check` MUST BE `false`. 
+Do NOT abuse this flag. It is an expensive operation reserved ONLY for real-world ideological, political, or historical entities.
+
+[DO NOT TRIGGER] (Keep false):
+- Generic speech, dialogue, or arguments.
+- Generic people, jobs, or situational roles .
+- Generic clothing, masks, or weapons .
+- Clarifying the immediate plot or events in the video.
+
+[ONLY TRIGGER] (Set true) IF explicitly mentioned in the report:
+1. Recognizable public figures or their parodies .
+2. National, regional, or religious flags/symbols.
+3. Political logos, slogans, or patches.
+4. Specific named organizations or historical references.
+5. [Unidentified Key Figure], leader lookalikes, impersonations, or other clearly salient but not yet identified real-world figure candidates.
+6. Distinctive gestures/salutes/portraits/chants that may carry ideological or historical meaning.
+
+If `needs_external_check` is true, `external_check_focus` MUST be exactly ONE of the following (Do NOT invent new categories like "role"): 
+identity, symbol, slogan, phrase, historical_reference, organization, gesture, ideology_marker, unknown.
+
+If `needs_external_check` is false, `external_check_focus` and `external_check_hint` MUST be exactly "".
+
+=====================
+Query Design Rules (Low-Assumption & Retrieval-Friendly)
+=====================
+1. query_text is for EVIDENCE RETRIEVAL, not for asking questions. Do NOT use QA wording ("what is he saying").
+2. LOW-ASSUMPTION: Minimize interpretive assumptions. Use observable anchors (e.g., "person in dark jacket raising an object") over inferred roles or motives.
+3. DO NOT hard-code uncertain interpretations into query_text. Keep them neutral.
+4. query_type MUST be one of: ASR, OCR, Visual. (Do not use Mixed).
+   - ASR: For spoken words. Must describe the visible scene, speaker appearance, or interaction context, but do not rely on speaker identity.
+   - OCR: For on-screen text. Must describe where the text is or what scene it overlays (e.g., "text on screen during final explosion sequence").
+   - Visual: For people, clothing, impersonations, symbols, actions, or objects.
+5. query_text should usually contain:
+   main target + strongest visible anchor.
+6. If a query resolves a `[Key Unclear Points]` item, make the query target the observable test, not the final interpretation.
+7. Prefer queries about imitation makeup, face resemblance, costume resemblance, portraits, symbols, emblems, and patches when they may change the interpretation.
 
 =====================
 Output Format
 =====================
-
-Output valid JSON only in exactly this format:
+Output valid JSON only. The first non-space character must be "{" and the last must be "}".
 
 {
   "retrieval_queries": [
     {
       "id": "Q1",
       "time_hint": "",
-      "query_type": "",
-      "query_text": "",
-      "why_this_query": "",
-      "needs_external_check": false,
-      "external_check_focus": "",
-      "external_check_hint": ""
+      "query_type": "ASR | OCR | Visual",
+      "query_text": "Short, keyword-rich, retrieval-friendly phrase packed with visual anchors",
+      "why_this_query": "One short sentence explaining what needs verification or interpretation.",
+      "needs_external_check": true,
+      "external_check_focus": "symbol",
+      "external_check_hint": "Verify the meaning or identity significance of the visible symbol, figure, or slogan."
     }
   ]
 }
-
-=====================
-Field Rules
-=====================
-
-- id:
-  Use Q1, Q2, Q3...
-
-- time_hint:
-  A coarse evidence locator only, not an exact timestamp.
-  Prefer one of:
-  beginning, early-middle, middle, late-middle, ending, transition
-  If useful, you may append an unclear-point label such as:
-  "middle | U1"
-
-- query_type:
-  Must be one of:
-  ASR, OCR, Visual, Mixed
-
-  Choose:
-  - ASR when the evidence is mainly spoken words, dialogue, narration, shouted phrases, tone, crying, laughter, chanting, or other audible cues
-  - OCR when the evidence is mainly subtitles, captions, titles, banners, headlines, labels, signs, or readable on-screen text
-  - Visual when the evidence is mainly people, appearance, clothing, gestures, movement, object interaction, symbols, flags, patches, weapons, or scene content
-  - Mixed when verification clearly requires more than one video-internal source together
-
-- query_text:
-  A short, keyword-rich, retrieval-friendly query.
-  Use one sentence only.
-  Keep it concrete and specific.
-  Focus on observable evidence only.
-  Prefer short phrases involving:
-  - spoken wording
-  - visible text
-  - people
-  - clothing
-  - objects
-  - symbols
-  - actions
-  - gestures
-  - sound cues
-  - scene elements
-
-- why_this_query:
-  One short sentence explaining why this query matters for later verification or judgment.
-  Keep it practical and evidence-oriented.
-
-- needs_external_check:
-  true or false
-
-  Set it to true when the retrieved evidence may also require external background investigation.
-
-  Typical triggers include:
-  - a potentially recognizable public figure whose identity is uncertain
-  - a named person, group, organization, country marker, or historical event
-  - a distinctive symbol, flag, patch, logo, emblem, salute, or gesture
-  - a slogan, phrase, nickname, chant, or headline that may carry political, religious, ideological, extremist, or historical meaning
-  - any word, text, or visual marker whose significance could materially change the final interpretation once identified
-
-  Do NOT set it to true for generic objects, ordinary actions, or generic appearance descriptions unless they likely carry specific external symbolic or identity significance.
-
-- external_check_focus:
-  If needs_external_check is true, choose one of:
-  identity, symbol, slogan, phrase, historical_reference, organization, gesture, ideology_marker, unknown
-
-  If needs_external_check is false, output an empty string.
-
-- external_check_hint:
-  If needs_external_check is true, write one short sentence explaining what may need external investigation.
-  Keep it concise and specific.
-  If needs_external_check is false, output an empty string.
-
-=====================
-Important Precision Rules
-=====================
-
-1. Never fabricate exact timestamps.
-2. Never convert speculation into fact.
-3. Never infer religion, ethnicity, nationality, ideology, or political alignment from appearance alone.
-4. Only name a person, group, religion, country, ideology, organization, or symbol if it is explicitly stated in the report or directly indicated by visible text/symbols described in the report.
-5. If identity is uncertain, use neutral observable descriptions such as:
-   - person in black robe
-   - man in suit and tie
-   - six-pointed star symbol
-   - red armband with black symbol
-6. needs_external_check should be used carefully, not over-triggered.
-7. Do not output duplicate or near-duplicate queries unless they clearly serve different evidence targets.
 """
 
 QUERY_PRECISION_ADDON = """\
 Additional precision constraints for this run:
 
-- Use time_hint only as a soft retrieval prior, never as an exact timestamp.
-- Prefer phase hints already present in the report:
-  beginning / early-middle / middle / late-middle / ending / transition
+- Set time_hint to "".
 - query_text must stay short, concrete, and easy to route downstream.
-- For ASR queries, prefer spoken wording, speaker tone, narration, chants, or sound cues.
-- For OCR queries, prefer exact text phrases if explicitly present in the report.
-- For Visual queries, prefer distinctive visible anchors such as clothing, symbol, flag, patch, object, gesture, motion, or scene composition.
-- For Mixed queries, use them only when the same verification target clearly needs multiple video-internal sources together.
+- query_type must be one of:
+  ASR / OCR / Visual
+- Do not use Mixed.
+
+=====================
+Retrieval-first principle
+=====================
+
+- query_text is for evidence retrieval, not for final interpretation.
+- The main purpose of query_text is to help downstream modules find the correct candidate segment.
+- Do not write query_text as a broad question about meaning, motive, ideology, or final judgment.
+- If interpretation is needed, place it in why_this_query, not in query_text.
+- Prefer wording that still works even if the upstream global interpretation is partially wrong.
+- Prefer noun/action phrases over full sentences.
+
+=====================
+Low-assumption rule
+=====================
+
+- Minimize interpretive assumptions in query_text.
+- Prefer observable anchors over inferred roles, motives, or event labels.
+- If two phrasings are possible, choose the one with fewer assumptions.
+- Do not hard-code uncertain interpretations into query_text.
+- Prefer observable wording such as:
+  person in dark jacket,
+  person wearing face covering,
+  person at podium,
+  uniformed person,
+  raising object,
+  entering scene,
+  removing head covering,
+  speaking near stage,
+  exchange between two people
+
+=====================
+ASR query rule
+=====================
+
+- If the report contains [Speech Transcript], use its wording to decide what spoken content needs retrieval.
+- ASR query_text should usually look like:
+  "spoken words during [visible scene anchor]"
+  not:
+  "what does he say about ..."
+- Do not rely on speaker names or speaker attribution.
+
+=====================
+ASR query constraints
+=====================
+
+- For ASR queries:
+  - the downstream pipeline will first retrieve the relevant visual segment and return a coarse time span,
+    then extract the corresponding audio clip for recognition
+  - therefore ASR queries must be segment-localization-friendly, not just answer-seeking
+  - include where the speech happens or what visible interaction anchors the speech segment
+  - ASR queries should help locate a candidate clip before transcription
+  - prefer concise forms such as:
+    "spoken words during podium scene with person in bright jacket"
+    "spoken words during close interaction between two people"
+    "spoken words during vehicle-side confrontation"
+    "spoken words during crowd scene with central figure"
+  - avoid vague QA-style wording such as:
+    "what is he saying"
+    "what do they mean"
+  - avoid putting disputed interpretation directly into query_text
+
+=====================
+OCR query constraints
+=====================
+
+- For OCR queries:
+  - prefer exact text phrases if explicitly present in the report
+  - if exact text is uncertain, use scene, object, or region anchors to help localize the right frame
+  - visual anchors are allowed and encouraged when they help locate the correct text region
+  - prefer retrieval-friendly forms such as:
+    "text on banner above stage"
+    "headline text on screen"
+    "caption text in lower third of frame"
+
+=====================
+Visual query constraints
+=====================
+
+- For Visual queries:
+  - prefer distinctive visible anchors such as clothing, face resemblance, makeup, symbol, flag, patch, object, gesture, motion, or scene composition
+  - prefer directly observable actions over inferred event labels
+  - use compact descriptions tied to visible evidence
+  - strongly prioritize figure-identification cues, imitation makeup/costume, portraits, emblems, flags, insignia, and patches when present
+
+=====================
+External-check constraints
+=====================
+
 - needs_external_check may be true for any query_type.
 - Set needs_external_check = true only when the retrieved evidence may reasonably benefit from external background lookup.
 - Strong triggers for external checking include:
   named people,
   uncertain but potentially recognizable figures,
+  impersonations or lookalikes of real figures,
   flags,
   symbols,
   patches,
@@ -304,8 +345,20 @@ Additional precision constraints for this run:
 - external_check_focus must be one of:
   identity / symbol / slogan / phrase / historical_reference / organization / gesture / ideology_marker / unknown
 - external_check_hint should be short, practical, and investigative.
+- external_check_hint should explain exactly what to verify externally, for example:
+  "Identify the person or public-figure lookalike shown here."
+  "Verify the meaning of the visible flag, emblem, patch, or slogan."
 - If needs_external_check is false, external_check_focus and external_check_hint must both be empty strings.
+
+=====================
+Style constraints
+=====================
+
 - Keep why_this_query short and evidence-oriented.
+- query_text should usually be a short retrieval phrase, not a natural-language full question.
+- Prefer one concrete target per query.
+- Do not output duplicate or near-duplicate queries unless they clearly serve different evidence targets.
+- Prefer fewer, higher-value queries over many overlapping ones.
 - Output JSON only.
 - The first non-space character must be "{"
 - The last non-space character must be "}"
@@ -323,15 +376,33 @@ Rules:
 3. Keep unique details; do not drop rare but important evidence.
 4. If segment reports conflict, keep both possibilities and mark uncertainty.
 5. Use both visual and audio evidence.
-6. Do NOT output timestamps.
+6. Do NOT output timestamps or phase labels.
 7. Do NOT output JSON.
+8. Separate direct evidence from interpretation strictly:
+   - Use [Observed] for direct evidence
+   - Use [Inferred] for interpretation
+9. Do NOT let visual context fill in missing audio words.
+10. In the transcript section, preserve spoken wording rather than paraphrasing.
+11. Do NOT treat on-screen text as spoken audio unless it is actually heard.
+12. When merging overlapping audio evidence:
+   - keep the fullest reliable wording
+   - avoid duplicate transcript lines caused by overlap
+   - do not use speaker labels
+13. Preserve high-value entities and external-check candidates:
+   - do not drop uncertain but salient identities, symbols, slogans, patches, logos, gestures, or portraits
+   - pay special attention to public-figure lookalikes, impersonations, imitation makeup/costume, and politically or historically meaningful symbols
+   - keep them neutrally described if recognition is uncertain
 
-===================== 
-Output Format: 
+=====================
+Output Format:
 =====================
 
 [Scene]
-- setting, people, roles, context
+- setting: ...
+- people: ...
+- roles: ...
+- high-value entities: ...
+- context: ...
 
 [Full Video Narrative]
 - one concise paragraph describing the full video flow from beginning to ending
@@ -339,45 +410,43 @@ Output Format:
 
 [Observed Visual Events]
 
-E1 [phase]:
+E1:
 - [Observed] ...
 
-E2 [phase]:
+E2:
 - [Observed] ...
 
-E3 [phase]:
+E3:
 - [Observed] ...
 
-[Full Audio Track Analysis]
-- one concise paragraph summarizing speech presence, tone/emotion, background sound changes, and silence/noise periods
-- cover beginning, middle, and ending
-- do not fabricate exact wording if unclear
-
-[ASR Transcript] 
-- provide speech transcription from heard audio only (NO timestamps) 
-- if speaker identity is unclear, label as Speaker-Unknown - if words are unclear, mark them as [unclear] 
-- do NOT use on-screen text unless it is actually spoken in audio
+[Speech Transcript]
+- "..."
+- "..."
+- include spoken wording only
+- do NOT add speaker labels
+- do NOT add timestamps
+- do NOT paraphrase
+- if a short part is uncertain, omit only that small part and keep the rest
+- if no reliable speech is audible anywhere, write: none reliable
 
 [Main Interpretation]
 - [Inferred] the most likely explanation of what is happening
 
 [Alternative Interpretation]
-- [Inferred] provide a second plausible explanation from another angle，this is mandatory 
+- [Inferred] provide a second plausible explanation from another angle
 
 [Key Unclear Points]
 
 U1 (related to E2):
 - what is unclear:
-- why it is unclear:
 - what needs verification:
 
 U2 (related to E3):
 - what is unclear:
-- why it is unclear:
 - what needs verification:
 
 [Preliminary Conclusion]
-- cautious summary
+- [Inferred] cautious summary
 - confidence: low / medium / high
 """
 
@@ -385,8 +454,7 @@ MERGE_REQUIRED_HEADERS = [
     "[Scene]",
     "[Full Video Narrative]",
     "[Observed Visual Events]",
-    "[Full Audio Track Analysis]",
-    "[ASR Transcript]",
+    "[Speech Transcript]",
     "[Main Interpretation]",
     "[Alternative Interpretation]",
     "[Key Unclear Points]",
@@ -394,9 +462,6 @@ MERGE_REQUIRED_HEADERS = [
 ]
 
 
-_EVENT_TIME_RE = re.compile(r"^\s*([EA]\d+)\s*\[([^\]]+)\]\s*:", re.MULTILINE)
-_EVENT_ID_RE = re.compile(r"\b([EA]\d+)\b", re.IGNORECASE)
-_TIME_TOKEN_RE = re.compile(r"(\d{1,2}):(\d{2})")
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 
 
@@ -422,21 +487,10 @@ class RetrievalQuery:
 
 
 @dataclass
-class QueryEvidence:
-    id: str
-    time_hint: str
-    query_text: str
-    asr_text: str
-    evidence_note: str
-    audio_segment_path: str
-
-
-@dataclass
 class QueryExtractionResult:
     raw_text: str
     parsed_json: dict[str, Any] | None
     retrieval_queries: list[RetrievalQuery]
-    query_evidence: list[QueryEvidence]
     parse_error: bool
     parse_error_message: str | None
 
@@ -445,7 +499,6 @@ class QueryExtractionResult:
             "raw_text": self.raw_text,
             "parsed_json": self.parsed_json,
             "retrieval_queries": [_query_to_output_dict(q) for q in self.retrieval_queries],
-            "query_evidence": [asdict(e) for e in self.query_evidence],
             "parse_error": self.parse_error,
             "parse_error_message": self.parse_error_message,
         }
@@ -482,15 +535,9 @@ class QueryRuntime:
 
 
 @dataclass
-class ASRRuntime:
-    asr_pipe: Any
-
-
-@dataclass
 class ModelRegistry:
     omni: OmniRuntime | None = None
     query: QueryRuntime | None = None
-    asr: ASRRuntime | None = None
 
 
 def build_global_understanding_prompt(user_focus: str = "") -> str:
@@ -568,19 +615,19 @@ def _postprocess_report_text(text: str) -> str:
     text = _strip_timestamp_tokens(text)
     lines = text.splitlines()
     out: list[str] = []
-    in_asr = False
-    seen_asr: set[str] = set()
+    in_speech = False
+    seen_speech: set[str] = set()
     for line in lines:
         stripped = line.strip()
-        if re.match(r"^\[ASR Transcript\]$", stripped):
-            in_asr = True
-            out.append("[ASR Transcript]")
+        if re.match(r"^\[(Speech Transcript|Heard Speech Fragments)\]$", stripped):
+            in_speech = True
+            out.append("[Speech Transcript]")
             continue
-        if re.match(r"^\[[^\]]+\]$", stripped) and stripped != "[ASR Transcript]":
-            in_asr = False
+        if re.match(r"^\[[^\]]+\]$", stripped) and stripped not in {"[Speech Transcript]", "[Heard Speech Fragments]"}:
+            in_speech = False
             out.append(line)
             continue
-        if not in_asr:
+        if not in_speech:
             out.append(line)
             continue
 
@@ -594,16 +641,16 @@ def _postprocess_report_text(text: str) -> str:
         norm = re.sub(r"\s+", " ", norm)
         if not norm:
             continue
-        if norm in seen_asr:
+        if norm in seen_speech:
             continue
-        seen_asr.add(norm)
+        seen_speech.add(norm)
         out.append(content)
 
     merged = "\n".join(out).strip()
-    if "[ASR Transcript]" in merged:
-        asr_tail = merged.split("[ASR Transcript]", 1)[1].strip()
-        if not asr_tail:
-            merged = merged + "\n- [No reliable speech detected]"
+    if "[Speech Transcript]" in merged:
+        speech_tail = merged.split("[Speech Transcript]", 1)[1].strip()
+        if not speech_tail:
+            merged = merged + "\n- none reliable"
     return merged
 
 
@@ -705,21 +752,6 @@ def _generate_query_text_with_stats(
     return text, generated_tokens
 
 
-def _generate_query_text(
-    runtime: QueryRuntime,
-    prompt: str,
-    max_new_tokens: int,
-    system_message: str,
-) -> str:
-    text, _ = _generate_query_text_with_stats(
-        runtime=runtime,
-        prompt=prompt,
-        max_new_tokens=max_new_tokens,
-        system_message=system_message,
-    )
-    return text
-
-
 def _generate_merge_report_with_auto_continue(
     runtime: QueryRuntime,
     prompt: str,
@@ -766,108 +798,6 @@ def _generate_merge_report_with_auto_continue(
         continuation_count += 1
 
     return merged_text, continuation_count
-
-
-def _looks_like_incomplete_json_output(
-    text: str,
-    generated_tokens: int,
-    max_new_tokens: int,
-) -> bool:
-    stripped = (text or "").strip()
-    if not stripped:
-        return True
-    if generated_tokens >= max(1, int(max_new_tokens) - 4):
-        return True
-    if stripped.count("{") > stripped.count("}"):
-        return True
-    if stripped.count("[") > stripped.count("]"):
-        return True
-    if stripped.count('"') % 2 == 1:
-        return True
-    if ("retrieval_queries" in stripped or '"queries"' in stripped) and not stripped.endswith("}"):
-        return True
-    return False
-
-
-def _repair_query_json_output(
-    runtime: QueryRuntime,
-    original_prompt: str,
-    partial_output: str,
-    max_new_tokens: int,
-    max_attempts: int = 2,
-) -> str:
-    current = (partial_output or "").strip()
-    for _ in range(max_attempts):
-        repair_prompt = (
-            "Your previous output was truncated or malformed.\n"
-            "Regenerate ONE complete valid JSON object only.\n"
-            "Schema MUST be:\n"
-            "{\n"
-            '  "retrieval_queries": [\n'
-            "    {\n"
-            '      "id": "Q1",\n'
-            '      "time_hint": "",\n'
-            '      "query_type": "",\n'
-            '      "query_text": "",\n'
-            '      "why_this_query": "",\n'
-            '      "needs_external_check": false,\n'
-            '      "external_check_focus": "",\n'
-            '      "external_check_hint": ""\n'
-            "    }\n"
-            "  ]\n"
-            "}\n"
-            "Hard rules:\n"
-            f"- At most {MAX_RETRIEVAL_QUERIES} queries.\n"
-            "- Do NOT use key `queries`; must use `retrieval_queries`.\n"
-            "- query_type MUST be one of: ASR, OCR, Visual, Mixed.\n"
-            "- Output JSON only; no markdown/code fences/explanations.\n\n"
-            "Original task prompt:\n"
-            f"{original_prompt}\n\n"
-            "Previous partial output:\n"
-            f"{current}\n"
-        )
-        repaired = _generate_query_text(
-            runtime=runtime,
-            prompt=repair_prompt,
-            max_new_tokens=max_new_tokens,
-            system_message=(
-                "You are a strict JSON fixer. "
-                "Return one complete JSON object only."
-            ),
-        ).strip()
-        repaired = _clean_query_model_output(repaired)
-        if repaired.startswith("{") and repaired.endswith("}"):
-            return repaired
-        if repaired:
-            current = _append_non_overlapping_text(current, repaired)
-    return current
-
-
-def _extract_event_time_map(report_text: str) -> dict[str, str]:
-    """从模块 A 报告中提取事件 ID 到时间段的映射，如 E2 -> [00:03–00:06]。"""
-    mapping: dict[str, str] = {}
-    for match in _EVENT_TIME_RE.finditer(report_text):
-        event_id = match.group(1).upper()
-        time_range = match.group(2).strip()
-        mapping[event_id] = f"[{time_range}]"
-    return mapping
-
-
-def _resolve_time_hint_from_event_ids(time_hint: str, event_time_map: dict[str, str]) -> str:
-    """若 time_hint 为 E2/A1 等事件 ID，则自动映射为时间段。"""
-    hint = (time_hint or "").strip()
-    if not hint:
-        return ""
-
-    # 已含时间戳则直接保留
-    if _TIME_TOKEN_RE.search(hint):
-        return hint
-
-    ids = [m.upper() for m in _EVENT_ID_RE.findall(hint)]
-    resolved = [event_time_map[i] for i in ids if i in event_time_map]
-    if resolved:
-        return "; ".join(resolved)
-    return hint
 
 
 def build_query_extraction_prompt(report_text: str) -> str:
@@ -972,111 +902,28 @@ def extract_last_json_object(text: str) -> dict[str, Any]:
     raise ValueError("No valid JSON object found in query model output.")
 
 
-def _coalesce_query_value(item: dict[str, Any], keys: list[str], default: Any = "") -> Any:
-    for key in keys:
-        if key not in item:
-            continue
-        value = item.get(key)
-        if value is None:
-            continue
-        if isinstance(value, str) and not value.strip():
-            continue
-        return value
-    return default
-
-
-def _to_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        v = value.strip().lower()
-        if v in {"true", "1", "yes", "y"}:
-            return True
-        if v in {"false", "0", "no", "n"}:
-            return False
-    return default
-
-
-def _is_query_dict(item: Any) -> bool:
-    if not isinstance(item, dict):
-        return False
-    keys = set(item.keys())
-    signals = {
-        "id",
-        "query_text",
-        "query",
-        "query_type",
-        "time_hint",
-        "why_this_query",
-    }
-    return bool(keys & signals)
-
-
-def _extract_query_list(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
-    preferred_keys = ["retrieval_queries", "queries", "query_list", "query_items"]
-    for key in preferred_keys:
-        value = payload.get(key)
-        if isinstance(value, list) and all(_is_query_dict(x) for x in value):
-            return value
-
-    for value in payload.values():
-        if isinstance(value, dict):
-            nested = _extract_query_list(value)
-            if nested is not None:
-                return nested
-
-    for value in payload.values():
-        if isinstance(value, list) and value and all(_is_query_dict(x) for x in value):
-            return value
-    return None
-
-
-def _normalize_query_type(raw_query_type: str) -> str:
-    allowed = {"ASR", "OCR", "Visual", "Mixed", "RAG"}
-    mapping = {
-        "ASR": "ASR",
-        "AUDIO": "ASR",
-        "OCR": "OCR",
-        "TEXT": "OCR",
-        "VISUAL": "Visual",
-        "VISION": "Visual",
-        "MIXED": "Mixed",
-        "MULTIMODAL": "Mixed",
-        "RAG": "RAG",
-    }
-    query_type_upper = (raw_query_type or "").strip().upper()
-    query_type = mapping.get(query_type_upper, "Visual")
-    if query_type not in allowed:
-        return "Visual"
-    return query_type
-
-
 def _normalize_single_query_item(
     item: dict[str, Any],
     index: int,
-    event_time_map: dict[str, str],
 ) -> tuple[RetrievalQuery | None, str | None]:
-    qid = str(_coalesce_query_value(item, ["id", "query_id"], default=f"Q{index + 1}")).strip() or f"Q{index + 1}"
-    raw_time_hint = str(_coalesce_query_value(item, ["time_hint", "time", "phase_hint"], default="")).strip()
-    resolved_time_hint = _resolve_time_hint_from_event_ids(raw_time_hint, event_time_map)
+    qid = str(coalesce_query_value(item, ["id", "query_id"], default=f"Q{index + 1}")).strip() or f"Q{index + 1}"
+    time_hint = str(coalesce_query_value(item, ["time_hint", "time", "phase_hint"], default="")).strip()
     query_text = str(
-        _coalesce_query_value(
+        coalesce_query_value(
             item,
             ["query_text", "query", "text", "retrieval_query", "query_content"],
             default="",
         )
     ).strip()
     why_this_query = str(
-        _coalesce_query_value(
+        coalesce_query_value(
             item,
             ["why_this_query", "reason", "rationale", "why"],
             default="",
         )
     ).strip()
-    query_type = _normalize_query_type(
-        str(_coalesce_query_value(item, ["query_type", "type", "route"], default="Visual"))
+    query_type = normalize_query_type(
+        str(coalesce_query_value(item, ["query_type", "type", "route"], default="Visual"))
     )
 
     if not query_text:
@@ -1103,14 +950,14 @@ def _normalize_single_query_item(
     }
     extra_fields = {k: v for k, v in item.items() if k not in known_core_keys}
 
-    extra_fields["needs_external_check"] = _to_bool(item.get("needs_external_check"), default=False)
+    extra_fields["needs_external_check"] = to_bool(item.get("needs_external_check"), default=False)
     extra_fields["external_check_focus"] = str(item.get("external_check_focus", "") or "").strip()
     extra_fields["external_check_hint"] = str(item.get("external_check_hint", "") or "").strip()
 
     return (
         RetrievalQuery(
             id=qid,
-            time_hint=resolved_time_hint,
+            time_hint=time_hint,
             query_type=query_type,
             query_text=query_text,
             why_this_query=why_this_query,
@@ -1126,13 +973,12 @@ def _query_to_output_dict(query: RetrievalQuery) -> dict[str, Any]:
 
 def _validate_and_normalize_queries(
     payload: dict[str, Any],
-    event_time_map: dict[str, str],
 ) -> tuple[list[RetrievalQuery], list[str]]:
     """兼容不同 Query Schema，仅强约束核心字段并保留额外字段。"""
     errors: list[str] = []
     normalized: list[RetrievalQuery] = []
 
-    queries = _extract_query_list(payload)
+    queries = extract_query_list(payload)
     if not isinstance(queries, list):
         return [], ["No valid query list found. Expected key retrieval_queries/queries."]
 
@@ -1143,7 +989,7 @@ def _validate_and_normalize_queries(
             errors.append(f"retrieval_queries[{idx}] must be an object.")
             continue
 
-        query, err = _normalize_single_query_item(item=item, index=idx, event_time_map=event_time_map)
+        query, err = _normalize_single_query_item(item=item, index=idx)
         if err:
             errors.append(err)
             continue
@@ -1151,50 +997,6 @@ def _validate_and_normalize_queries(
             normalized.append(query)
 
     return normalized, errors
-
-
-def _time_token_to_seconds(token: tuple[str, str]) -> float:
-    minutes = int(token[0])
-    seconds = int(token[1])
-    return minutes * 60 + seconds
-
-
-def _parse_time_hint_range_seconds(time_hint: str) -> tuple[float, float] | None:
-    matches = _TIME_TOKEN_RE.findall(time_hint or "")
-    if len(matches) >= 2:
-        start = _time_token_to_seconds(matches[0])
-        end = _time_token_to_seconds(matches[1])
-        if end <= start:
-            end = start + 4.0
-        return max(0.0, start), end
-    if len(matches) == 1:
-        start = _time_token_to_seconds(matches[0])
-        return max(0.0, start), start + 4.0
-    return None
-
-
-def _extract_audio_segment(video_path: str, start_sec: float, end_sec: float, out_wav: Path) -> None:
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-ss",
-        f"{start_sec:.2f}",
-        "-to",
-        f"{end_sec:.2f}",
-        "-i",
-        video_path,
-        "-vn",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        str(out_wav),
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        stderr_tail = (proc.stderr or "").strip()[-300:]
-        raise RuntimeError(f"ffmpeg failed: {stderr_tail}")
-
 
 def _load_omni_runtime(
     model_path: str,
@@ -1302,36 +1104,6 @@ def _load_query_runtime(
     return QueryRuntime(model=model, tokenizer=tokenizer, device=device)
 
 
-def _load_asr_runtime(asr_model_path: str, asr_device: str | None = None) -> ASRRuntime:
-    print("\n" + "=" * 60)
-    print("ASR：开始加载模型")
-    print("=" * 60)
-
-    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    if asr_device is None and n_gpu > 0:
-        asr_device = "cuda:0"
-    elif asr_device is None:
-        asr_device = "cpu"
-
-    if str(asr_device).startswith("cuda"):
-        device_index = int(str(asr_device).split(":")[1]) if ":" in str(asr_device) else 0
-        asr_pipe = pipeline(
-            task="automatic-speech-recognition",
-            model=asr_model_path,
-            device=device_index,
-            torch_dtype=_get_query_dtype(asr_device),
-        )
-    else:
-        asr_pipe = pipeline(
-            task="automatic-speech-recognition",
-            model=asr_model_path,
-            device=-1,
-        )
-
-    print("ASR 模型加载完成")
-    return ASRRuntime(asr_pipe=asr_pipe)
-
-
 def initialize_model_registry(
     omni_model_path: str,
     omni_device: str | None = None,
@@ -1339,11 +1111,8 @@ def initialize_model_registry(
     load_query: bool = False,
     query_model_path: str = "/sda/yuqifan/HFOCUS/Qwen3-4B",
     query_device: str | None = None,
-    load_asr: bool = False,
-    asr_model_path: str = "/sda/yuqifan/HFOCUS/Qwen-audio",
-    asr_device: str | None = None,
 ) -> ModelRegistry:
-    """统一预加载模型：默认可在一个阶段将 Omni / Query / ASR 一起加载，后续可扩展新模型。"""
+    """统一预加载模型：默认可在一个阶段将 Omni / Query 一起加载。"""
     print("\n" + "=" * 60)
     print("统一模型预加载开始")
     print("=" * 60)
@@ -1359,12 +1128,6 @@ def initialize_model_registry(
         registry.query = _load_query_runtime(
             query_model_path=query_model_path,
             device=query_device,
-        )
-
-    if load_asr:
-        registry.asr = _load_asr_runtime(
-            asr_model_path=asr_model_path,
-            asr_device=asr_device,
         )
 
     print("\n统一模型预加载完成")
@@ -1409,11 +1172,13 @@ def run_global_video_understanding(
     system_prompt = (
         "You are a powerful multimodal assistant specialized in video understanding. "
         "Jointly use visual and audio evidence from the same video. "
-        "Pay attention to actions, scene context, temporal order, spoken content, tone, "
-        "background sounds, and meaningful acoustic cues. "
+        "Pay attention to actions, scene context, spoken content, and meaningful visual/audio cues. "
         "Do not rely on visual stream alone when audio is informative. "
-        "Analyze audio across the full timeline, not only sparse moments. "
+        "Analyze audio across the full timeline. "
         "Do not confuse on-screen text with spoken audio unless actually heard. "
+        "Focus on fuller speech transcription rather than speaker attribution. "
+        "Be sensitive to important figures, impersonations, leader lookalikes, symbols, slogans, patches, logos, and gestures. "
+        "Do not output timestamps or phase labels. "
         "Ground conclusions in evidence and clearly distinguish observation from interpretation."
     )
 
@@ -1608,181 +1373,57 @@ def run_global_video_understanding(
     return report_text
 
 
-def _build_asr_evidence_for_queries(
-    queries: list[RetrievalQuery],
-    video_path: str,
-    asr_runtime: ASRRuntime,
-    keep_audio_segments: bool = False,
-) -> list[QueryEvidence]:
-    evidences: list[QueryEvidence] = []
-
-    tmp_dir = Path(tempfile.mkdtemp(prefix="query_asr_"))
-    try:
-        for query in queries:
-            time_range = _parse_time_hint_range_seconds(query.time_hint)
-            if time_range is None:
-                evidences.append(
-                    QueryEvidence(
-                        id=query.id,
-                        time_hint=query.time_hint,
-                        query_text=query.query_text,
-                        asr_text="",
-                        evidence_note="No valid timestamp found in time_hint; skipped ASR.",
-                        audio_segment_path="",
-                    )
-                )
-                continue
-
-            start_sec, end_sec = time_range
-            wav_path = tmp_dir / f"{query.id}.wav"
-
-            try:
-                _extract_audio_segment(video_path, start_sec, end_sec, wav_path)
-                asr_result = asr_runtime.asr_pipe(str(wav_path))
-                if isinstance(asr_result, dict):
-                    asr_text = str(asr_result.get("text", "")).strip()
-                else:
-                    asr_text = str(asr_result).strip()
-
-                evidences.append(
-                    QueryEvidence(
-                        id=query.id,
-                        time_hint=query.time_hint,
-                        query_text=query.query_text,
-                        asr_text=asr_text,
-                        evidence_note="ASR extracted from evidence segment.",
-                        audio_segment_path=str(wav_path) if keep_audio_segments else "",
-                    )
-                )
-            except Exception as exc:
-                evidences.append(
-                    QueryEvidence(
-                        id=query.id,
-                        time_hint=query.time_hint,
-                        query_text=query.query_text,
-                        asr_text="",
-                        evidence_note=f"ASR extraction failed: {exc}",
-                        audio_segment_path="",
-                    )
-                )
-
-            if not keep_audio_segments and wav_path.exists():
-                wav_path.unlink()
-    finally:
-        if not keep_audio_segments and tmp_dir.exists():
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    return evidences
-
-
 def run_query_extraction(
     report_text: str,
     query_model_path: str,
     device: str | None = None,
     max_new_tokens: int = 1024,
     query_runtime: QueryRuntime | None = None,
-    video_path: str | None = None,
-    asr_runtime: ASRRuntime | None = None,
-    keep_audio_segments: bool = False,
 ) -> QueryExtractionResult:
     """模块 C：从全局理解报告中提炼检索 Query（JSON 输出）。"""
 
     runtime = query_runtime
     if runtime is None:
         runtime = _load_query_runtime(query_model_path=query_model_path, device=device)
-    else:
-        print("\n[模块 C] 使用预加载 Query 模型")
-
-    print("\n" + "=" * 60)
-    print("模块 C：开始 Query 提炼")
-    print("=" * 60)
 
     prompt = build_query_extraction_prompt(report_text)
-    raw_text, generated_tokens = _generate_query_text_with_stats(
+    raw_text, _ = _generate_query_text_with_stats(
         runtime=runtime,
         prompt=prompt,
         max_new_tokens=max_new_tokens,
         system_message=(
             "You are a query extraction assistant. "
             "Output one complete valid JSON object only. "
+            "Use retrieval-friendly wording with strong visual anchors. "
+            "Do not rely on speaker attribution or time hints. "
+            "Use query_type only from ASR, OCR, Visual. "
             f"Use key retrieval_queries only and at most {MAX_RETRIEVAL_QUERIES} items."
         ),
     )
 
-    if _looks_like_incomplete_json_output(raw_text, generated_tokens, max_new_tokens):
-        print("\n[模块 C] 检测到 query 输出疑似截断/不完整，尝试自动修复...")
-        repaired = _repair_query_json_output(
-            runtime=runtime,
-            original_prompt=prompt,
-            partial_output=raw_text,
-            max_new_tokens=max_new_tokens,
-            max_attempts=2,
-        )
-        if repaired and repaired.strip() != raw_text.strip():
-            raw_text = repaired.strip()
-
-    print("原始 query model 输出:")
-    print(raw_text)
     cleaned_text = _clean_query_model_output(raw_text)
-    if cleaned_text != raw_text:
-        print("\n清洗后的 query model 输出（用于解析）:")
-        print(cleaned_text)
 
     parsed_json: dict[str, Any] | None = None
     retrieval_queries: list[RetrievalQuery] = []
-    query_evidence: list[QueryEvidence] = []
     parse_error = False
     parse_error_message: str | None = None
-
-    event_time_map = _extract_event_time_map(report_text)
 
     try:
         parsed_json = extract_last_json_object(cleaned_text)
         retrieval_queries, validation_errors = _validate_and_normalize_queries(
             parsed_json,
-            event_time_map=event_time_map,
         )
         if validation_errors:
             parse_error = True
             parse_error_message = "; ".join(validation_errors)
     except Exception as exc:
-        try:
-            parsed_json = extract_last_json_object(raw_text)
-            retrieval_queries, validation_errors = _validate_and_normalize_queries(
-                parsed_json,
-                event_time_map=event_time_map,
-            )
-            if validation_errors:
-                parse_error = True
-                parse_error_message = "; ".join(validation_errors)
-        except Exception:
-            parse_error = True
-            parse_error_message = str(exc)
-
-    if parse_error and parse_error_message:
-        print(f"[模块 C][解析告警] {parse_error_message}")
-
-    # 可选 ASR 证据增强
-    if asr_runtime is not None and video_path:
-        print("\n模块 C：开始 ASR 证据片段抽取")
-        query_evidence = _build_asr_evidence_for_queries(
-            queries=retrieval_queries,
-            video_path=video_path,
-            asr_runtime=asr_runtime,
-            keep_audio_segments=keep_audio_segments,
-        )
-
-    final_query_json = {"retrieval_queries": [_query_to_output_dict(q) for q in retrieval_queries]}
-
-    print(f"解析后的 query 数量: {len(retrieval_queries)}")
-    print("最终 query JSON:")
-    print(json.dumps(final_query_json, ensure_ascii=False, indent=2))
+        parse_error = True
+        parse_error_message = str(exc)
 
     return QueryExtractionResult(
         raw_text=raw_text,
         parsed_json=parsed_json,
         retrieval_queries=retrieval_queries,
-        query_evidence=query_evidence,
         parse_error=parse_error,
         parse_error_message=parse_error_message,
     )
@@ -1809,10 +1450,6 @@ def run_global_understanding_and_query_extraction(
     merge_batch_size: int = 6,
     merge_max_new_tokens: int = 1024,
     merge_max_continuations: int = 3,
-    run_asr_evidence: bool = False,
-    asr_model_path: str = "/sda/yuqifan/HFOCUS/Qwen-audio",
-    asr_device: str | None = None,
-    keep_audio_segments: bool = False,
     run_localizer: bool = False,
     localizer_config: dict[str, Any] | None = None,
     model_registry: ModelRegistry | None = None,
@@ -1828,9 +1465,6 @@ def run_global_understanding_and_query_extraction(
             load_query=True,
             query_model_path=query_model_path,
             query_device=query_device,
-            load_asr=run_asr_evidence,
-            asr_model_path=asr_model_path,
-            asr_device=asr_device,
         )
 
     report_text = run_global_video_understanding(
@@ -1863,9 +1497,6 @@ def run_global_understanding_and_query_extraction(
         device=query_device,
         max_new_tokens=query_max_new_tokens,
         query_runtime=registry.query,
-        video_path=video_path,
-        asr_runtime=registry.asr,
-        keep_audio_segments=keep_audio_segments,
     )
 
     evidence_results: list[dict[str, Any]] | None = None
@@ -1896,13 +1527,6 @@ def _resolve_query_json_save_path(video_path: str, save_query_json: str) -> Path
         video = Path(video_path)
         return video.with_suffix(".queries.json")
     return Path(save_query_json)
-
-
-def _resolve_evidence_json_save_path(video_path: str, save_evidence_json: str) -> Path:
-    if save_evidence_json == "auto":
-        video = Path(video_path)
-        return video.with_suffix(".evidence.json")
-    return Path(save_evidence_json)
 
 
 def _resolve_localization_json_save_path(video_path: str, save_localization_json: str) -> Path:
@@ -2109,10 +1733,6 @@ if __name__ == "__main__":
     parser.add_argument("--query_device", type=str, default=None, help="Query 模型运行设备，如 cuda:0 / cpu")
     parser.add_argument("--query_max_new_tokens", type=int, default=1024, help="模块 C 最大生成 token 数")
 
-    parser.add_argument("--run_asr_evidence", action="store_true", help="为每条 query 抽取时间片段并做 ASR")
-    parser.add_argument("--asr_model", type=str, default="/sda/yuqifan/HFOCUS/Qwen-audio", help="ASR 模型路径")
-    parser.add_argument("--asr_device", type=str, default=None, help="ASR 运行设备，如 cuda:0 / cpu")
-    parser.add_argument("--keep_audio_segments", action="store_true", help="保留抽取的音频片段文件")
     parser.add_argument("--run_localizer", action="store_true", help="启用 query-guided 局部证据定位（FOCUS-localizer）")
     parser.add_argument("--localizer_blip_model", type=str, default="large", help="localizer 使用的 BLIP ITM 模型（base/large）")
     parser.add_argument("--localizer_device", type=str, default=None, help="localizer 推理设备，如 cuda:0 / cpu")
@@ -2147,13 +1767,6 @@ if __name__ == "__main__":
         help="可选保存模块 C Query JSON。仅写 --save_query_json 时自动保存为同名 .queries.json；也可指定输出路径",
     )
     parser.add_argument(
-        "--save_evidence_json",
-        nargs="?",
-        const="auto",
-        default=None,
-        help="可选保存 ASR 证据 JSON。仅写 --save_evidence_json 时自动保存为同名 .evidence.json；也可指定输出路径",
-    )
-    parser.add_argument(
         "--save_localization_json",
         nargs="?",
         const="auto",
@@ -2172,9 +1785,6 @@ if __name__ == "__main__":
             load_query=True,
             query_model_path=args.query_model,
             query_device=args.query_device,
-            load_asr=args.run_asr_evidence,
-            asr_model_path=args.asr_model,
-            asr_device=args.asr_device,
         )
 
     report = run_global_video_understanding(
@@ -2219,9 +1829,6 @@ if __name__ == "__main__":
             device=args.query_device,
             max_new_tokens=args.query_max_new_tokens,
             query_runtime=model_registry.query if model_registry else None,
-            video_path=args.video,
-            asr_runtime=(model_registry.asr if model_registry else (_load_asr_runtime(args.asr_model, args.asr_device) if args.run_asr_evidence else None)),
-            keep_audio_segments=args.keep_audio_segments,
         )
 
         query_json_payload = {"retrieval_queries": [_query_to_output_dict(q) for q in query_result.retrieval_queries]}
@@ -2281,21 +1888,6 @@ if __name__ == "__main__":
         elif args.save_localization_json is not None:
             print("\n[提示] 已指定 --save_localization_json，但未启用 --run_localizer，跳过保存。")
 
-        if args.run_asr_evidence:
-            evidence_payload = {"query_evidence": [asdict(e) for e in query_result.query_evidence]}
-            print("\n" + "=" * 60)
-            print("ASR 证据结果")
-            print("=" * 60)
-            print(json.dumps(evidence_payload, ensure_ascii=False, indent=2))
-
-            if args.save_evidence_json is not None:
-                evidence_save_path = _resolve_evidence_json_save_path(args.video, args.save_evidence_json)
-                evidence_save_path.parent.mkdir(parents=True, exist_ok=True)
-                evidence_save_path.write_text(
-                    json.dumps(evidence_payload, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                print(f"\nASR 证据 JSON 已保存: {evidence_save_path}")
     else:
         if args.save_query_json is not None:
             print("\n[提示] 已指定 --save_query_json，但未启用 --run_query_extraction，跳过保存。")
@@ -2303,7 +1895,3 @@ if __name__ == "__main__":
             print("\n[提示] 已启用 --run_localizer，但未启用 --run_query_extraction，localizer 不会执行。")
         if args.save_localization_json is not None:
             print("\n[提示] 已指定 --save_localization_json，但未启用 --run_query_extraction，跳过保存。")
-        if args.run_asr_evidence:
-            print("\n[提示] 已启用 --run_asr_evidence，但未启用 --run_query_extraction，ASR 不会执行。")
-        if args.save_evidence_json is not None:
-            print("\n[提示] 已指定 --save_evidence_json，但未启用 --run_query_extraction，跳过保存。")

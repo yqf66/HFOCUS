@@ -2,9 +2,11 @@
 Lightweight query-guided local evidence localization built from FOCUS ideas.
 
 This module adapts keyframe-focused FOCUS into a short-video local evidence
-localizer:
+localizer with route-aware query handling:
 - locate one main evidence segment per query
 - return only a few supporting frames inside that segment
+- always localize visually first for every supported query route
+- currently supports Visual, ASR, and OCR query routes
 
 Public APIs:
 - localize_query_evidence(video_path, query, config)
@@ -14,11 +16,14 @@ Public APIs:
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, is_dataclass
+import subprocess
+import tempfile
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+from query_utils import normalize_query_input
 
 try:
     from decord import VideoReader, cpu
@@ -28,6 +33,7 @@ except Exception:  # pragma: no cover - optional import guard
 
 
 SimilarityFn = Callable[[Any, str, list[int]], list[float]]
+_SUPPORTED_QUERY_TYPES = {"Visual", "ASR", "OCR"}
 
 
 default_config: dict[str, Any] = {
@@ -40,6 +46,13 @@ default_config: dict[str, Any] = {
     "segment_score_threshold": 0.35,
     "min_frame_gap_sec": 0.3,
     "max_support_frames": 6,
+    "asr_sample_rate": 16000,
+    "asr_clip_pad_before_sec": 0.30,
+    "asr_clip_pad_after_sec": 0.60,
+    "asr_clip_min_len": 1.2,
+    "asr_clip_max_len": 12.0,
+    "asr_keep_audio_clip": False,
+    "ocr_max_frames": 4,
 }
 
 
@@ -319,6 +332,305 @@ def _sample_indices(start_idx: int, end_idx: int, step: int, anchors: list[int] 
     return sorted(set(indices))
 
 
+def _extract_audio_segment_to_wav(
+    video_path: str,
+    start_sec: float,
+    end_sec: float,
+    sample_rate: int,
+) -> Path:
+    start = float(max(0.0, start_sec))
+    end = float(max(start + 1e-3, end_sec))
+    duration = float(max(1e-3, end - start))
+
+    with tempfile.NamedTemporaryFile(prefix="focus_asr_clip_", suffix=".wav", delete=False) as tmp:
+        wav_path = Path(tmp.name)
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{start:.3f}",
+        "-i",
+        video_path,
+        "-t",
+        f"{duration:.3f}",
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        str(max(8000, int(sample_rate))),
+        str(wav_path),
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip().splitlines()
+        tail = err[-1] if err else "unknown ffmpeg error"
+        if wav_path.exists():
+            wav_path.unlink()
+        raise RuntimeError(f"ffmpeg segment extraction failed: {tail}")
+    return wav_path
+
+
+def _default_asr_infer_placeholder(
+    audio_path: str,
+    *,
+    query: dict[str, Any],
+    segment: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    _ = query, segment, config
+    return {
+        "status": "placeholder",
+        "text": "",
+        "note": "ASR placeholder: provide config['asr_infer_fn'] to run real ASR.",
+        "audio_path": audio_path,
+    }
+
+
+def _default_ocr_infer_placeholder(
+    video: Any,
+    keyframes: list[dict[str, Any]],
+    *,
+    query: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    _ = video, query, config
+    return {
+        "status": "placeholder",
+        "texts": [],
+        "note": "OCR placeholder: provide config['ocr_infer_fn'] to run real OCR.",
+        "frame_count": len(keyframes),
+    }
+
+
+def _resolve_asr_infer_fn(config: dict[str, Any]) -> Callable[..., Any]:
+    fn = config.get("asr_infer_fn")
+    if callable(fn):
+        return fn
+    return _default_asr_infer_placeholder
+
+
+def _resolve_ocr_infer_fn(config: dict[str, Any]) -> Callable[..., Any]:
+    fn = config.get("ocr_infer_fn")
+    if callable(fn):
+        return fn
+    return _default_ocr_infer_placeholder
+
+
+def _derive_asr_clip_segment(
+    visual_result: dict[str, Any],
+    cfg: dict[str, Any],
+    duration_sec: float,
+) -> dict[str, Any] | None:
+    main_segment = visual_result.get("main_segment")
+    if not isinstance(main_segment, dict):
+        return None
+
+    try:
+        main_start = float(main_segment.get("start_sec", 0.0))
+        main_end = float(main_segment.get("end_sec", main_start))
+    except Exception:
+        return None
+    if main_end < main_start:
+        main_start, main_end = main_end, main_start
+    main_start = float(_clamp(main_start, 0.0, duration_sec))
+    main_end = float(_clamp(main_end, 0.0, duration_sec))
+    if main_end <= main_start:
+        return None
+
+    support = visual_result.get("supporting_frames")
+    support_frames = support if isinstance(support, list) else []
+    support_times: list[float] = []
+    for item in support_frames:
+        if not isinstance(item, dict):
+            continue
+        try:
+            t = float(item.get("time_sec"))
+        except Exception:
+            continue
+        if math.isfinite(t):
+            support_times.append(float(_clamp(t, 0.0, duration_sec)))
+
+    raw_start = min(support_times) if support_times else main_start
+    raw_end = max(support_times) if support_times else main_end
+    raw_start = min(raw_start, main_start)
+    raw_end = max(raw_end, main_end)
+
+    pad_before = float(max(0.0, cfg.get("asr_clip_pad_before_sec", 0.30)))
+    pad_after = float(max(0.0, cfg.get("asr_clip_pad_after_sec", 0.60)))
+    start_sec, end_sec = _enforce_segment_length(
+        start_sec=raw_start - pad_before,
+        end_sec=raw_end + pad_after,
+        center_sec=0.5 * (raw_start + raw_end),
+        min_len=float(max(0.1, cfg.get("asr_clip_min_len", 1.2))),
+        max_len=float(max(0.2, cfg.get("asr_clip_max_len", 12.0))),
+        duration_sec=duration_sec,
+    )
+    if end_sec <= start_sec:
+        return None
+    return {
+        "start_sec": float(start_sec),
+        "end_sec": float(end_sec),
+        "raw_start_sec": float(raw_start),
+        "raw_end_sec": float(raw_end),
+        "pad_before_sec": float(pad_before),
+        "pad_after_sec": float(pad_after),
+    }
+
+
+def _select_ocr_keyframes(
+    visual_result: dict[str, Any],
+    cfg: dict[str, Any],
+    fps: float,
+    total_frames: int,
+) -> list[dict[str, Any]]:
+    support = visual_result.get("supporting_frames")
+    support_frames = support if isinstance(support, list) else []
+
+    normalized: list[dict[str, Any]] = []
+    for item in support_frames:
+        if not isinstance(item, dict):
+            continue
+        try:
+            frame_idx = int(item.get("frame_idx"))
+            time_sec = float(item.get("time_sec", frame_idx / max(1e-6, fps)))
+            score = float(item.get("score", 0.0))
+        except Exception:
+            continue
+        if 0 <= frame_idx < total_frames:
+            normalized.append(
+                {
+                    "frame_idx": int(frame_idx),
+                    "time_sec": float(time_sec),
+                    "score": float(score),
+                }
+            )
+
+    max_frames = max(1, int(cfg.get("ocr_max_frames", 4)))
+    if normalized:
+        picked = sorted(normalized, key=lambda x: float(x["score"]), reverse=True)[:max_frames]
+        return sorted(picked, key=lambda x: int(x["frame_idx"]))
+
+    main_segment = visual_result.get("main_segment")
+    if isinstance(main_segment, dict):
+        center = 0.5 * (float(main_segment.get("start_sec", 0.0)) + float(main_segment.get("end_sec", 0.0)))
+        frame_idx = int(round(center * max(1e-6, fps)))
+        frame_idx = max(0, min(total_frames - 1, frame_idx))
+        return [
+            {
+                "frame_idx": int(frame_idx),
+                "time_sec": float(frame_idx / max(1e-6, fps)),
+                "score": float(main_segment.get("score", 0.0)),
+            }
+        ]
+    return []
+
+
+def _run_asr_on_visual_segment(
+    video_path: str,
+    query_dict: dict[str, Any],
+    visual_result: dict[str, Any],
+    cfg: dict[str, Any],
+    duration_sec: float,
+) -> dict[str, Any]:
+    if not bool(visual_result.get("evidence_found")):
+        return {"status": "skipped", "reason": "visual_evidence_not_found", "segment": None, "output": None}
+
+    segment = _derive_asr_clip_segment(
+        visual_result=visual_result,
+        cfg=cfg,
+        duration_sec=duration_sec,
+    )
+    if segment is None:
+        return {"status": "skipped", "reason": "invalid_visual_segment", "segment": None, "output": None}
+
+    keep_audio = bool(cfg.get("asr_keep_audio_clip", False))
+    sample_rate = int(cfg.get("asr_sample_rate", 16000))
+    wav_path: Path | None = None
+    try:
+        wav_path = _extract_audio_segment_to_wav(
+            video_path=video_path,
+            start_sec=float(segment["start_sec"]),
+            end_sec=float(segment["end_sec"]),
+            sample_rate=sample_rate,
+        )
+        infer_fn = _resolve_asr_infer_fn(cfg)
+        output = infer_fn(
+            str(wav_path),
+            query=query_dict,
+            segment=segment,
+            config=cfg,
+        )
+        status = "ok"
+        if isinstance(output, dict) and str(output.get("status", "")).strip():
+            status = str(output.get("status")).strip()
+        result = {
+            "status": status,
+            "reason": "",
+            "segment": segment,
+            "audio_clip_path": str(wav_path) if keep_audio else "",
+            "output": output,
+        }
+    except Exception as exc:
+        result = {
+            "status": "failed",
+            "reason": str(exc),
+            "segment": segment,
+            "audio_clip_path": str(wav_path) if (wav_path and keep_audio) else "",
+            "output": None,
+        }
+    finally:
+        if wav_path is not None and wav_path.exists() and not keep_audio:
+            wav_path.unlink()
+    return result
+
+
+def _run_ocr_on_visual_frames(
+    video: Any,
+    query_dict: dict[str, Any],
+    visual_result: dict[str, Any],
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    if not bool(visual_result.get("evidence_found")):
+        return {"status": "skipped", "reason": "visual_evidence_not_found", "keyframes": [], "output": None}
+
+    total_frames = int(len(video))
+    fps = float(video.get_avg_fps())
+    keyframes = _select_ocr_keyframes(
+        visual_result=visual_result,
+        cfg=cfg,
+        fps=fps,
+        total_frames=total_frames,
+    )
+    if not keyframes:
+        return {"status": "skipped", "reason": "no_valid_keyframes", "keyframes": [], "output": None}
+
+    infer_fn = _resolve_ocr_infer_fn(cfg)
+    try:
+        output = infer_fn(
+            video,
+            keyframes,
+            query=query_dict,
+            config=cfg,
+        )
+        status = "ok"
+        if isinstance(output, dict) and str(output.get("status", "")).strip():
+            status = str(output.get("status")).strip()
+        return {
+            "status": status,
+            "reason": "",
+            "keyframes": keyframes,
+            "output": output,
+        }
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "reason": str(exc),
+            "keyframes": keyframes,
+            "output": None,
+        }
+
+
 def _resolve_similarity_fn(config: dict[str, Any]) -> SimilarityFn:
     similarity_fn = config.get("similarity_fn")
     if callable(similarity_fn):
@@ -476,90 +788,30 @@ def _empty_result(query: dict[str, Any]) -> dict[str, Any]:
         "evidence_found": False,
         "main_segment": None,
         "supporting_frames": [],
+        "skip_reason": "",
     }
-
-
-def _coalesce_query_value(query: dict[str, Any], keys: list[str], default: Any = "") -> Any:
-    for key in keys:
-        if key not in query:
-            continue
-        value = query.get(key)
-        if value is None:
-            continue
-        if isinstance(value, str) and not value.strip():
-            continue
-        return value
-    return default
-
-
-def _normalize_query_type(raw_type: str) -> str:
-    mapping = {
-        "ASR": "ASR",
-        "AUDIO": "ASR",
-        "OCR": "OCR",
-        "TEXT": "OCR",
-        "VISUAL": "Visual",
-        "VISION": "Visual",
-        "MIXED": "Mixed",
-        "MULTIMODAL": "Mixed",
-        "RAG": "RAG",
-    }
-    return mapping.get((raw_type or "").strip().upper(), "Visual")
 
 
 def _normalize_query(query: Any) -> dict[str, Any]:
-    query_dict: dict[str, Any] | None = None
-    if isinstance(query, dict):
-        query_dict = dict(query)
-    if is_dataclass(query):
-        obj = asdict(query)
-        if isinstance(obj, dict):
-            query_dict = obj
-    required = ("id", "time_hint", "query_type", "query_text", "why_this_query")
-    if query_dict is None and all(hasattr(query, key) for key in required):
-        query_dict = {key: getattr(query, key) for key in required}
-        if hasattr(query, "extra_fields") and isinstance(getattr(query, "extra_fields"), dict):
-            query_dict.update(getattr(query, "extra_fields"))
-    if query_dict is None:
-        raise TypeError("Each query must be a dict or a RetrievalQuery-like object.")
-
-    if isinstance(query_dict.get("extra_fields"), dict):
-        merged = dict(query_dict["extra_fields"])
-        merged.update({k: v for k, v in query_dict.items() if k != "extra_fields"})
-        query_dict = merged
-
-    query_id = str(_coalesce_query_value(query_dict, ["id", "query_id"], default="")).strip()
-    query_text = str(
-        _coalesce_query_value(
-            query_dict,
-            ["query_text", "query", "text", "retrieval_query", "query_content"],
-            default="",
-        )
-    ).strip()
-    query_type = _normalize_query_type(
-        str(_coalesce_query_value(query_dict, ["query_type", "type", "route"], default="Visual"))
-    )
-    time_hint = str(_coalesce_query_value(query_dict, ["time_hint", "time", "phase_hint"], default="")).strip()
-    why_this_query = str(
-        _coalesce_query_value(query_dict, ["why_this_query", "reason", "rationale", "why"], default="")
-    ).strip()
-
-    normalized = dict(query_dict)
-    normalized["id"] = query_id
-    normalized["query_text"] = query_text
-    normalized["query_type"] = query_type
-    normalized["time_hint"] = time_hint
-    normalized["why_this_query"] = why_this_query
-    return normalized
+    return normalize_query_input(query)
 
 
-def _localize_single_query(
+def _is_supported_query_type(query_type: str) -> bool:
+    return (query_type or "").strip() in _SUPPORTED_QUERY_TYPES
+
+
+def _unsupported_query_type_reason(query_type: str) -> str:
+    current = (query_type or "").strip() or "Unknown"
+    supported = ", ".join(sorted(_SUPPORTED_QUERY_TYPES))
+    return f"query_type='{current}' is not supported yet; current localizer supports: {supported}."
+
+
+def _localize_visual_query(
     video: Any,
-    query: Any,
+    query_dict: dict[str, Any],
     cfg: dict[str, Any],
     similarity_fn: SimilarityFn,
 ) -> dict[str, Any]:
-    query_dict = _normalize_query(query)
     result = _empty_result(query_dict)
     query_text = str(query_dict.get("query_text", "")).strip()
     if not query_text:
@@ -651,6 +903,123 @@ def _localize_single_query(
     return result
 
 
+def _localize_asr_query(
+    video: Any,
+    video_path: str,
+    query_dict: dict[str, Any],
+    cfg: dict[str, Any],
+    similarity_fn: SimilarityFn,
+) -> dict[str, Any]:
+    visual_result = _localize_visual_query(
+        video=video,
+        query_dict=query_dict,
+        cfg=cfg,
+        similarity_fn=similarity_fn,
+    )
+    if not bool(visual_result.get("evidence_found")):
+        if not str(visual_result.get("skip_reason", "")).strip():
+            visual_result["skip_reason"] = "Visual localization failed for ASR route."
+        return visual_result
+
+    fps = float(video.get_avg_fps())
+    total_frames = int(len(video))
+    duration_sec = float(total_frames / max(1e-6, fps))
+    asr_payload = _run_asr_on_visual_segment(
+        video_path=video_path,
+        query_dict=query_dict,
+        visual_result=visual_result,
+        cfg=cfg,
+        duration_sec=duration_sec,
+    )
+    visual_result["asr_segment"] = asr_payload.get("segment")
+    visual_result["asr_result"] = asr_payload.get("output")
+    visual_result["asr_status"] = str(asr_payload.get("status", "unknown"))
+    visual_result["asr_reason"] = str(asr_payload.get("reason", "")).strip()
+    audio_clip_path = str(asr_payload.get("audio_clip_path", "")).strip()
+    if audio_clip_path:
+        visual_result["asr_audio_clip_path"] = audio_clip_path
+    return visual_result
+
+
+def _localize_ocr_query(
+    video: Any,
+    query_dict: dict[str, Any],
+    cfg: dict[str, Any],
+    similarity_fn: SimilarityFn,
+) -> dict[str, Any]:
+    visual_result = _localize_visual_query(
+        video=video,
+        query_dict=query_dict,
+        cfg=cfg,
+        similarity_fn=similarity_fn,
+    )
+    if not bool(visual_result.get("evidence_found")):
+        if not str(visual_result.get("skip_reason", "")).strip():
+            visual_result["skip_reason"] = "Visual localization failed for OCR route."
+        return visual_result
+
+    ocr_payload = _run_ocr_on_visual_frames(
+        video=video,
+        query_dict=query_dict,
+        visual_result=visual_result,
+        cfg=cfg,
+    )
+    visual_result["ocr_keyframes"] = ocr_payload.get("keyframes", [])
+    visual_result["ocr_result"] = ocr_payload.get("output")
+    visual_result["ocr_status"] = str(ocr_payload.get("status", "unknown"))
+    visual_result["ocr_reason"] = str(ocr_payload.get("reason", "")).strip()
+    return visual_result
+
+
+def _localize_single_query(
+    video: Any,
+    video_path: str,
+    query: Any,
+    cfg: dict[str, Any],
+    similarity_fn: SimilarityFn | None = None,
+) -> dict[str, Any]:
+    query_dict = _normalize_query(query)
+    query_type = str(query_dict.get("query_type", "")).strip()
+    if not _is_supported_query_type(query_type):
+        result = _empty_result(query_dict)
+        result["skip_reason"] = _unsupported_query_type_reason(query_type)
+        return result
+
+    if similarity_fn is None:
+        result = _empty_result(query_dict)
+        result["skip_reason"] = "Visual backend is not initialized."
+        return result
+
+    if query_type == "Visual":
+        return _localize_visual_query(
+            video=video,
+            query_dict=query_dict,
+            cfg=cfg,
+            similarity_fn=similarity_fn,
+        )
+
+    if query_type == "ASR":
+        return _localize_asr_query(
+            video=video,
+            video_path=video_path,
+            query_dict=query_dict,
+            cfg=cfg,
+            similarity_fn=similarity_fn,
+        )
+
+    if query_type == "OCR":
+        return _localize_ocr_query(
+            video=video,
+            query_dict=query_dict,
+            cfg=cfg,
+            similarity_fn=similarity_fn,
+        )
+
+    result = _empty_result(query_dict)
+    result["skip_reason"] = _unsupported_query_type_reason(query_type)
+    return result
+
+
 def _open_video(video_path: str) -> Any:
     if VideoReader is None or cpu is None:
         raise ImportError("decord is required for focus_localizer.py. Please install decord.")
@@ -667,9 +1036,23 @@ def localize_query_evidence(video_path: str, query: Any, config: dict | None = N
         config: localizer config (defaults to short-video default_config)
     """
     cfg = _merge_config(config)
-    similarity_fn = _resolve_similarity_fn(cfg)
+    normalized_query = _normalize_query(query)
+    query_type = str(normalized_query.get("query_type", "")).strip()
+    if not _is_supported_query_type(query_type):
+        result = _empty_result(normalized_query)
+        result["skip_reason"] = _unsupported_query_type_reason(query_type)
+        return result
+
+    similarity_fn: SimilarityFn | None = _resolve_similarity_fn(cfg)
     video = _open_video(video_path)
-    return _localize_single_query(video=video, query=query, cfg=cfg, similarity_fn=similarity_fn)
+
+    return _localize_single_query(
+        video=video,
+        video_path=video_path,
+        query=normalized_query,
+        cfg=cfg,
+        similarity_fn=similarity_fn,
+    )
 
 
 def localize_all_queries(
@@ -686,9 +1069,34 @@ def localize_all_queries(
         config: localizer config (defaults to short-video default_config)
     """
     cfg = _merge_config(config)
-    similarity_fn = _resolve_similarity_fn(cfg)
+    normalized_queries = [_normalize_query(q) for q in retrieval_queries]
+    query_types = {str(q.get("query_type", "")).strip() for q in normalized_queries}
+    has_supported_query = any(_is_supported_query_type(t) for t in query_types)
+    if not has_supported_query:
+        results: list[dict] = []
+        for q in normalized_queries:
+            item = _empty_result(q)
+            item["skip_reason"] = _unsupported_query_type_reason(str(q.get("query_type", "")))
+            results.append(item)
+        return results
+
+    needs_visual = "Visual" in query_types
+    needs_asr = "ASR" in query_types
+    needs_ocr = "OCR" in query_types
+
+    similarity_fn: SimilarityFn | None = None
+    if needs_visual or needs_asr or needs_ocr:
+        similarity_fn = _resolve_similarity_fn(cfg)
+
     video = _open_video(video_path)
+
     return [
-        _localize_single_query(video=video, query=q, cfg=cfg, similarity_fn=similarity_fn)
-        for q in retrieval_queries
+        _localize_single_query(
+            video=video,
+            video_path=video_path,
+            query=q,
+            cfg=cfg,
+            similarity_fn=similarity_fn,
+        )
+        for q in normalized_queries
     ]
