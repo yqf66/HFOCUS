@@ -6,7 +6,7 @@ localizer with route-aware query handling:
 - locate one main evidence segment per query
 - return only a few supporting frames inside that segment
 - always localize visually first for every supported query route
-- currently supports Visual, ASR, and OCR query routes
+- currently supports Visual and ASR query routes
 
 Public APIs:
 - localize_query_evidence(video_path, query, config)
@@ -16,8 +16,10 @@ Public APIs:
 from __future__ import annotations
 
 import math
+import re
 import subprocess
 import tempfile
+import wave
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
@@ -33,7 +35,7 @@ except Exception:  # pragma: no cover - optional import guard
 
 
 SimilarityFn = Callable[[Any, str, list[int]], list[float]]
-_SUPPORTED_QUERY_TYPES = {"Visual", "ASR", "OCR"}
+_SUPPORTED_QUERY_TYPES = {"Visual", "ASR"}
 
 
 default_config: dict[str, Any] = {
@@ -52,7 +54,13 @@ default_config: dict[str, Any] = {
     "asr_clip_min_len": 1.2,
     "asr_clip_max_len": 12.0,
     "asr_keep_audio_clip": False,
-    "ocr_max_frames": 4,
+    "asr_backend": "whisper",
+    "whisper_model_path": "/sda/yuqifan/HFOCUS/Whisper/large-v3.pt",
+    "whisper_device": "",
+    "whisper_language": "",
+    "whisper_temperature": 0.0,
+    "whisper_beam_size": 5,
+    "asr_analysis_max_events": 4,
 }
 
 
@@ -371,6 +379,346 @@ def _extract_audio_segment_to_wav(
     return wav_path
 
 
+def _resolve_whisper_device(device_hint: str) -> str:
+    device = (device_hint or "").strip()
+    if device:
+        return device
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def _resolve_whisper_model_path(config: dict[str, Any]) -> str:
+    explicit = str(config.get("whisper_model_path", "")).strip()
+    if explicit:
+        return explicit
+    return "/sda/yuqifan/HFOCUS/Whisper/large-v3.pt"
+
+
+class _OpenAIWhisperRuntime:
+    def __init__(self, model_path: str, device: str):
+        try:
+            import whisper
+        except Exception as exc:  # pragma: no cover - dependency guard
+            raise ImportError(
+                "Whisper ASR requires openai-whisper. Please install it or provide config['asr_infer_fn']."
+            ) from exc
+
+        model_file = Path(model_path)
+        if not model_file.exists():
+            raise FileNotFoundError(f"Whisper model not found: {model_path}")
+
+        self.device = _resolve_whisper_device(device)
+        self.model_path = str(model_file)
+        self.model = whisper.load_model(self.model_path, device=self.device)
+
+
+@lru_cache(maxsize=2)
+def _get_openai_whisper_runtime(model_path: str, device: str) -> _OpenAIWhisperRuntime:
+    return _OpenAIWhisperRuntime(model_path=model_path, device=device)
+
+
+def _read_wav_mono_float32(audio_path: str) -> tuple[int, np.ndarray]:
+    with wave.open(audio_path, "rb") as wf:
+        channels = int(wf.getnchannels())
+        sample_width = int(wf.getsampwidth())
+        sample_rate = int(wf.getframerate())
+        frame_count = int(wf.getnframes())
+        raw = wf.readframes(frame_count)
+
+    if sample_width == 1:
+        data = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
+        data = (data - 128.0) / 128.0
+    elif sample_width == 2:
+        data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sample_width == 3:
+        buf = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
+        vals = (
+            buf[:, 0].astype(np.int32)
+            | (buf[:, 1].astype(np.int32) << 8)
+            | (buf[:, 2].astype(np.int32) << 16)
+        )
+        sign = vals & 0x800000
+        vals = vals - (sign << 1)
+        data = vals.astype(np.float32) / 8388608.0
+    elif sample_width == 4:
+        data = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+    else:
+        raise ValueError(f"Unsupported WAV sample width: {sample_width}")
+
+    if channels > 1 and data.size >= channels:
+        usable = (data.size // channels) * channels
+        data = data[:usable].reshape(-1, channels).mean(axis=1)
+
+    data = np.asarray(data, dtype=np.float32)
+    if data.size == 0:
+        data = np.zeros((1,), dtype=np.float32)
+    return sample_rate, np.clip(data, -1.0, 1.0)
+
+
+def _compute_audio_stats(audio_path: str) -> dict[str, float]:
+    sr, samples = _read_wav_mono_float32(audio_path)
+    abs_samples = np.abs(samples)
+    rms = float(np.sqrt(np.mean(np.square(samples)) + 1e-12))
+    rms_db = float(20.0 * np.log10(rms + 1e-8))
+    peak = float(np.max(abs_samples))
+    crest = float(peak / max(1e-8, rms))
+    zcr = float(np.mean(samples[:-1] * samples[1:] < 0.0)) if samples.size > 1 else 0.0
+
+    frame_size = max(1, int(round(0.05 * sr)))
+    usable = (samples.size // frame_size) * frame_size
+    if usable > 0:
+        frames = samples[:usable].reshape(-1, frame_size)
+        frame_rms = np.sqrt(np.mean(np.square(frames), axis=1) + 1e-12)
+    else:
+        frame_rms = np.array([rms], dtype=np.float32)
+
+    median_rms = float(np.median(frame_rms))
+    active_threshold = max(0.015, 1.8 * median_rms)
+    active_ratio = float(np.mean(frame_rms >= active_threshold))
+    burst_ratio = float(np.mean(frame_rms >= max(0.08, 2.5 * median_rms)))
+    dynamic_range = float(np.percentile(frame_rms, 90) - np.percentile(frame_rms, 10))
+
+    spectrum = np.abs(np.fft.rfft(samples))
+    freqs = np.fft.rfftfreq(samples.size, d=1.0 / max(1, sr))
+    spec_sum = float(np.sum(spectrum)) + 1e-8
+    centroid = float(np.sum(freqs * spectrum) / spec_sum)
+    high_band = float(np.sum(spectrum[freqs >= 2000.0]) / spec_sum)
+    low_band = float(np.sum(spectrum[freqs <= 300.0]) / spec_sum)
+
+    return {
+        "sample_rate": float(sr),
+        "duration_sec": float(samples.size / max(1, sr)),
+        "rms_db": rms_db,
+        "peak": peak,
+        "crest_factor": crest,
+        "zcr": zcr,
+        "active_ratio": active_ratio,
+        "burst_ratio": burst_ratio,
+        "dynamic_range": dynamic_range,
+        "spectral_centroid_hz": centroid,
+        "high_band_ratio": high_band,
+        "low_band_ratio": low_band,
+    }
+
+
+def _normalize_transcript_text(text: str) -> str:
+    cleaned = (text or "").strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned
+
+
+def _extract_whisper_segments(raw_result: dict[str, Any]) -> list[dict[str, Any]]:
+    segments = raw_result.get("segments")
+    if not isinstance(segments, list):
+        return []
+    parsed: list[dict[str, Any]] = []
+    for seg in segments[:64]:
+        if not isinstance(seg, dict):
+            continue
+        parsed.append(
+            {
+                "start_sec": float(seg.get("start", 0.0) or 0.0),
+                "end_sec": float(seg.get("end", 0.0) or 0.0),
+                "text": _normalize_transcript_text(str(seg.get("text", "") or "")),
+                "avg_logprob": float(seg.get("avg_logprob", 0.0) or 0.0),
+                "no_speech_prob": float(seg.get("no_speech_prob", 0.0) or 0.0),
+            }
+        )
+    return parsed
+
+
+def _contains_any(text: str, keywords: list[str]) -> bool:
+    return any(k in text for k in keywords)
+
+
+def _detect_sound_events(
+    transcript: str,
+    audio_stats: dict[str, float],
+    max_events: int,
+) -> list[dict[str, str]]:
+    events: list[dict[str, str]] = []
+    lower = (transcript or "").lower()
+
+    def add(event: str, confidence: str, reason: str) -> None:
+        if any(x.get("event") == event for x in events):
+            return
+        events.append({"event": event, "confidence": confidence, "reason": reason})
+
+    if _contains_any(lower, ["music", "bgm", "song", "melody", "lyrics", "♪", "背景音乐", "配乐", "音乐"]):
+        add("background_music", "high", "transcript contains explicit music-related cues")
+    if _contains_any(lower, ["scream", "screaming", "yell", "shout", "尖叫", "惨叫", "嘶吼", "大喊"]):
+        add("scream_or_loud_shout", "high", "transcript contains scream/shout related words")
+    if _contains_any(lower, ["explosion", "boom", "blast", "爆炸", "轰", "爆破"]):
+        add("explosion_like_event", "high", "transcript contains explosion-related cues")
+    if _contains_any(lower, ["glass", "shatter", "crash", "碎裂", "破碎", "玻璃", "撞击"]):
+        add("shatter_or_impact", "high", "transcript contains shatter/impact related words")
+
+    crest = float(audio_stats.get("crest_factor", 0.0))
+    active_ratio = float(audio_stats.get("active_ratio", 0.0))
+    high_band = float(audio_stats.get("high_band_ratio", 0.0))
+    rms_db = float(audio_stats.get("rms_db", -120.0))
+    burst_ratio = float(audio_stats.get("burst_ratio", 0.0))
+    zcr = float(audio_stats.get("zcr", 0.0))
+
+    if high_band > 0.38 and crest > 7.0 and active_ratio > 0.18:
+        add("high_frequency_sharp_sound", "medium", "high spectral high-band ratio with strong transients")
+    if crest > 10.0 and burst_ratio > 0.04 and active_ratio < 0.55:
+        add("impact_like_transients", "medium", "high crest factor with burst-like energy")
+    if active_ratio > 0.80 and zcr < 0.10 and -28.0 <= rms_db <= -12.0:
+        add("possible_background_music", "medium", "sustained activity with relatively stable energy")
+    if active_ratio < 0.08 and rms_db < -40.0:
+        add("very_low_audio_or_silence", "high", "very low energy and limited active frames")
+
+    if not events and active_ratio > 0.18:
+        add("speech_or_foreground_audio", "low", "speech-like activity detected but no specific event cue")
+    return events[: max(1, int(max_events))]
+
+
+def _infer_emotion_label(
+    transcript: str,
+    audio_stats: dict[str, float],
+) -> dict[str, str]:
+    lower = (transcript or "").lower()
+    rms_db = float(audio_stats.get("rms_db", -120.0))
+    crest = float(audio_stats.get("crest_factor", 0.0))
+    high_band = float(audio_stats.get("high_band_ratio", 0.0))
+    active_ratio = float(audio_stats.get("active_ratio", 0.0))
+
+    if _contains_any(lower, ["angry", "rage", "fight", "idiot", "hate", "怒", "愤怒", "吵", "骂"]):
+        return {"label": "tense", "confidence": "medium", "reason": "aggressive wording appears in transcript"}
+    if _contains_any(lower, ["happy", "laugh", "fun", "哈哈", "开心", "笑"]):
+        return {"label": "positive", "confidence": "medium", "reason": "positive/laughter cues in transcript"}
+    if active_ratio < 0.08 and rms_db < -40.0:
+        return {"label": "neutral", "confidence": "high", "reason": "audio is mostly quiet"}
+    if rms_db > -16.0 or (crest > 8.0 and high_band > 0.30):
+        return {"label": "tense", "confidence": "low", "reason": "high intensity and sharp acoustic profile"}
+    if rms_db < -24.0 and high_band < 0.20:
+        return {"label": "calm", "confidence": "low", "reason": "lower-energy and low-highband acoustic profile"}
+    return {"label": "neutral", "confidence": "low", "reason": "no strong emotional cue from transcript/acoustics"}
+
+
+def _build_asr_analysis_summary(
+    emotion: dict[str, str],
+    sound_events: list[dict[str, str]],
+) -> str:
+    emotion_label = str(emotion.get("label", "neutral"))
+    if sound_events:
+        events = ", ".join(str(x.get("event", "")) for x in sound_events if str(x.get("event", "")).strip())
+    else:
+        events = "none"
+    return f"emotion={emotion_label}; sound_events={events}"
+
+
+def _run_whisper_infer_with_model(
+    whisper_model: Any,
+    whisper_device: str,
+    whisper_model_path: str,
+    audio_path: str,
+    *,
+    query: dict[str, Any],
+    segment: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    _ = query, segment
+    language = str(config.get("whisper_language", "") or "").strip() or None
+    temperature = float(config.get("whisper_temperature", 0.0) or 0.0)
+    beam_size = int(config.get("whisper_beam_size", 5) or 5)
+    max_events = int(config.get("asr_analysis_max_events", 4) or 4)
+
+    transcribe_kwargs: dict[str, Any] = {
+        "task": "transcribe",
+        "temperature": temperature,
+        "beam_size": max(1, beam_size),
+        "fp16": str(whisper_device).startswith("cuda"),
+    }
+    if language:
+        transcribe_kwargs["language"] = language
+
+    try:
+        raw_result = whisper_model.transcribe(audio_path, **transcribe_kwargs)
+    except TypeError:
+        transcribe_kwargs.pop("beam_size", None)
+        raw_result = whisper_model.transcribe(audio_path, **transcribe_kwargs)
+
+    raw_result = raw_result if isinstance(raw_result, dict) else {}
+    transcript = _normalize_transcript_text(str(raw_result.get("text", "") or ""))
+    segments_payload = _extract_whisper_segments(raw_result)
+    audio_stats = _compute_audio_stats(audio_path)
+    sound_events = _detect_sound_events(transcript=transcript, audio_stats=audio_stats, max_events=max_events)
+    emotion = _infer_emotion_label(transcript=transcript, audio_stats=audio_stats)
+    summary = _build_asr_analysis_summary(emotion=emotion, sound_events=sound_events)
+
+    return {
+        "status": "ok",
+        "text": transcript,
+        "language": str(raw_result.get("language", "") or ""),
+        "segments": segments_payload,
+        "emotion": emotion,
+        "sound_events": sound_events,
+        "analysis_summary": summary,
+        "audio_stats": audio_stats,
+        "asr_backend": "whisper",
+        "whisper_device": str(whisper_device),
+        "whisper_model_path": str(whisper_model_path),
+    }
+
+
+def build_openai_whisper_asr_infer_fn(
+    whisper_model: Any,
+    *,
+    whisper_device: str = "",
+    whisper_model_path: str = "",
+) -> Callable[..., dict[str, Any]]:
+    device = _resolve_whisper_device(whisper_device)
+    model_path = (whisper_model_path or "").strip() or "preloaded"
+
+    def _infer(
+        audio_path: str,
+        *,
+        query: dict[str, Any],
+        segment: dict[str, Any],
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        return _run_whisper_infer_with_model(
+            whisper_model=whisper_model,
+            whisper_device=device,
+            whisper_model_path=model_path,
+            audio_path=audio_path,
+            query=query,
+            segment=segment,
+            config=config,
+        )
+
+    return _infer
+
+
+def _default_asr_infer_whisper(
+    audio_path: str,
+    *,
+    query: dict[str, Any],
+    segment: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    model_path = _resolve_whisper_model_path(config)
+    device = _resolve_whisper_device(str(config.get("whisper_device", "")))
+    runtime = _get_openai_whisper_runtime(model_path=model_path, device=device)
+    return _run_whisper_infer_with_model(
+        whisper_model=runtime.model,
+        whisper_device=runtime.device,
+        whisper_model_path=runtime.model_path,
+        audio_path=audio_path,
+        query=query,
+        segment=segment,
+        config=config,
+    )
+
+
 def _default_asr_infer_placeholder(
     audio_path: str,
     *,
@@ -382,24 +730,8 @@ def _default_asr_infer_placeholder(
     return {
         "status": "placeholder",
         "text": "",
-        "note": "ASR placeholder: provide config['asr_infer_fn'] to run real ASR.",
+        "note": "ASR placeholder: provide config['asr_infer_fn'].",
         "audio_path": audio_path,
-    }
-
-
-def _default_ocr_infer_placeholder(
-    video: Any,
-    keyframes: list[dict[str, Any]],
-    *,
-    query: dict[str, Any],
-    config: dict[str, Any],
-) -> dict[str, Any]:
-    _ = video, query, config
-    return {
-        "status": "placeholder",
-        "texts": [],
-        "note": "OCR placeholder: provide config['ocr_infer_fn'] to run real OCR.",
-        "frame_count": len(keyframes),
     }
 
 
@@ -407,14 +739,11 @@ def _resolve_asr_infer_fn(config: dict[str, Any]) -> Callable[..., Any]:
     fn = config.get("asr_infer_fn")
     if callable(fn):
         return fn
+
+    backend = str(config.get("asr_backend", "whisper")).strip().lower()
+    if backend in {"whisper", "openai-whisper", "openai_whisper"}:
+        return _default_asr_infer_whisper
     return _default_asr_infer_placeholder
-
-
-def _resolve_ocr_infer_fn(config: dict[str, Any]) -> Callable[..., Any]:
-    fn = config.get("ocr_infer_fn")
-    if callable(fn):
-        return fn
-    return _default_ocr_infer_placeholder
 
 
 def _derive_asr_clip_segment(
@@ -478,54 +807,6 @@ def _derive_asr_clip_segment(
     }
 
 
-def _select_ocr_keyframes(
-    visual_result: dict[str, Any],
-    cfg: dict[str, Any],
-    fps: float,
-    total_frames: int,
-) -> list[dict[str, Any]]:
-    support = visual_result.get("supporting_frames")
-    support_frames = support if isinstance(support, list) else []
-
-    normalized: list[dict[str, Any]] = []
-    for item in support_frames:
-        if not isinstance(item, dict):
-            continue
-        try:
-            frame_idx = int(item.get("frame_idx"))
-            time_sec = float(item.get("time_sec", frame_idx / max(1e-6, fps)))
-            score = float(item.get("score", 0.0))
-        except Exception:
-            continue
-        if 0 <= frame_idx < total_frames:
-            normalized.append(
-                {
-                    "frame_idx": int(frame_idx),
-                    "time_sec": float(time_sec),
-                    "score": float(score),
-                }
-            )
-
-    max_frames = max(1, int(cfg.get("ocr_max_frames", 4)))
-    if normalized:
-        picked = sorted(normalized, key=lambda x: float(x["score"]), reverse=True)[:max_frames]
-        return sorted(picked, key=lambda x: int(x["frame_idx"]))
-
-    main_segment = visual_result.get("main_segment")
-    if isinstance(main_segment, dict):
-        center = 0.5 * (float(main_segment.get("start_sec", 0.0)) + float(main_segment.get("end_sec", 0.0)))
-        frame_idx = int(round(center * max(1e-6, fps)))
-        frame_idx = max(0, min(total_frames - 1, frame_idx))
-        return [
-            {
-                "frame_idx": int(frame_idx),
-                "time_sec": float(frame_idx / max(1e-6, fps)),
-                "score": float(main_segment.get("score", 0.0)),
-            }
-        ]
-    return []
-
-
 def _run_asr_on_visual_segment(
     video_path: str,
     query_dict: dict[str, Any],
@@ -583,52 +864,6 @@ def _run_asr_on_visual_segment(
         if wav_path is not None and wav_path.exists() and not keep_audio:
             wav_path.unlink()
     return result
-
-
-def _run_ocr_on_visual_frames(
-    video: Any,
-    query_dict: dict[str, Any],
-    visual_result: dict[str, Any],
-    cfg: dict[str, Any],
-) -> dict[str, Any]:
-    if not bool(visual_result.get("evidence_found")):
-        return {"status": "skipped", "reason": "visual_evidence_not_found", "keyframes": [], "output": None}
-
-    total_frames = int(len(video))
-    fps = float(video.get_avg_fps())
-    keyframes = _select_ocr_keyframes(
-        visual_result=visual_result,
-        cfg=cfg,
-        fps=fps,
-        total_frames=total_frames,
-    )
-    if not keyframes:
-        return {"status": "skipped", "reason": "no_valid_keyframes", "keyframes": [], "output": None}
-
-    infer_fn = _resolve_ocr_infer_fn(cfg)
-    try:
-        output = infer_fn(
-            video,
-            keyframes,
-            query=query_dict,
-            config=cfg,
-        )
-        status = "ok"
-        if isinstance(output, dict) and str(output.get("status", "")).strip():
-            status = str(output.get("status")).strip()
-        return {
-            "status": status,
-            "reason": "",
-            "keyframes": keyframes,
-            "output": output,
-        }
-    except Exception as exc:
-        return {
-            "status": "failed",
-            "reason": str(exc),
-            "keyframes": keyframes,
-            "output": None,
-        }
 
 
 def _resolve_similarity_fn(config: dict[str, Any]) -> SimilarityFn:
@@ -793,7 +1028,11 @@ def _empty_result(query: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_query(query: Any) -> dict[str, Any]:
-    return normalize_query_input(query)
+    query_dict = normalize_query_input(query)
+    # Backward-compatibility bridge: OCR route is now merged into Visual route.
+    if str(query_dict.get("query_type", "")).strip() == "OCR":
+        query_dict["query_type"] = "Visual"
+    return query_dict
 
 
 def _is_supported_query_type(query_type: str) -> bool:
@@ -941,36 +1180,6 @@ def _localize_asr_query(
     return visual_result
 
 
-def _localize_ocr_query(
-    video: Any,
-    query_dict: dict[str, Any],
-    cfg: dict[str, Any],
-    similarity_fn: SimilarityFn,
-) -> dict[str, Any]:
-    visual_result = _localize_visual_query(
-        video=video,
-        query_dict=query_dict,
-        cfg=cfg,
-        similarity_fn=similarity_fn,
-    )
-    if not bool(visual_result.get("evidence_found")):
-        if not str(visual_result.get("skip_reason", "")).strip():
-            visual_result["skip_reason"] = "Visual localization failed for OCR route."
-        return visual_result
-
-    ocr_payload = _run_ocr_on_visual_frames(
-        video=video,
-        query_dict=query_dict,
-        visual_result=visual_result,
-        cfg=cfg,
-    )
-    visual_result["ocr_keyframes"] = ocr_payload.get("keyframes", [])
-    visual_result["ocr_result"] = ocr_payload.get("output")
-    visual_result["ocr_status"] = str(ocr_payload.get("status", "unknown"))
-    visual_result["ocr_reason"] = str(ocr_payload.get("reason", "")).strip()
-    return visual_result
-
-
 def _localize_single_query(
     video: Any,
     video_path: str,
@@ -1002,14 +1211,6 @@ def _localize_single_query(
         return _localize_asr_query(
             video=video,
             video_path=video_path,
-            query_dict=query_dict,
-            cfg=cfg,
-            similarity_fn=similarity_fn,
-        )
-
-    if query_type == "OCR":
-        return _localize_ocr_query(
-            video=video,
             query_dict=query_dict,
             cfg=cfg,
             similarity_fn=similarity_fn,
@@ -1082,10 +1283,9 @@ def localize_all_queries(
 
     needs_visual = "Visual" in query_types
     needs_asr = "ASR" in query_types
-    needs_ocr = "OCR" in query_types
 
     similarity_fn: SimilarityFn | None = None
-    if needs_visual or needs_asr or needs_ocr:
+    if needs_visual or needs_asr:
         similarity_fn = _resolve_similarity_fn(cfg)
 
     video = _open_video(video_path)

@@ -26,6 +26,7 @@ from query_utils import coalesce_query_value, extract_query_list, normalize_quer
 
 
 MAX_RETRIEVAL_QUERIES = 5
+DEFAULT_LOCALIZER_WHISPER_MODEL_PATH = "/sda/yuqifan/HFOCUS/Whisper/large-v3.pt"
 
 
 GLOBAL_UNDERSTANDING_PROMPT = """
@@ -48,7 +49,7 @@ Key Requirements:
 4. Unclear points MUST explicitly reference related Event IDs.
 5. Do NOT output timestamps or phase labels anywhere.
 
-6. [CRITICAL AUDIO-VISUAL FIREWALL]: Do NOT treat on-screen text (OCR) as spoken audio (ASR).
+6. [CRITICAL AUDIO-VISUAL FIREWALL]: Do NOT treat on-screen text as spoken audio (ASR).
    - If text is printed on screen but not audibly spoken by a real voice, it MUST NOT appear in the [Speech Transcript] section.
    - Do NOT use visual context to guess missing spoken words.
 
@@ -140,8 +141,8 @@ Each query should be easy for a retrieval system to route to the correct segment
 =====================
 [CRITICAL] Downstream Architecture Constraint & Doubt Translation
 =====================
-The downstream retrieval module uses Text-to-Image similarity FIRST to find the relevant video segment, then applies ASR/OCR if needed.
-THEREFORE, EVERY QUERY (including ASR and OCR) MUST CONTAIN STRONG VISUAL ANCHORS.
+The downstream retrieval module uses Text-to-Image similarity FIRST to find the relevant video segment, then applies ASR if needed.
+THEREFORE, EVERY QUERY (including ASR and Visual) MUST CONTAIN STRONG VISUAL ANCHORS.
 
 Furthermore, you must TRANSLATE ABSTRACT DOUBTS INTO VISIBLE TESTS. Do not query invisible motives; query the visible evidence that proves them.
 - Bad Doubt Query: "is the interaction hostile or friendly" (Abstract, invisible).
@@ -197,10 +198,9 @@ Query Design Rules (Low-Assumption & Retrieval-Friendly)
 1. query_text is for EVIDENCE RETRIEVAL, not for asking questions. Do NOT use QA wording ("what is he saying").
 2. LOW-ASSUMPTION: Minimize interpretive assumptions. Use observable anchors (e.g., "person in dark jacket raising an object") over inferred roles or motives.
 3. DO NOT hard-code uncertain interpretations into query_text. Keep them neutral.
-4. query_type MUST be one of: ASR, OCR, Visual. (Do not use Mixed).
+4. query_type MUST be one of: ASR, Visual. (Do not use Mixed).
    - ASR: For spoken words. Must describe the visible scene, speaker appearance, or interaction context, but do not rely on speaker identity.
-   - OCR: For on-screen text. Must describe where the text is or what scene it overlays (e.g., "text on screen during final explosion sequence").
-   - Visual: For people, clothing, impersonations, symbols, actions, or objects.
+   - Visual: For people, clothing, impersonations, symbols, actions, objects, and text-like visual cues (titles, subtitles, slogans, logos, fonts, overlays).
 5. query_text should usually contain:
    main target + strongest visible anchor.
 6. If a query resolves a `[Key Unclear Points]` item, make the query target the observable test, not the final interpretation.
@@ -216,7 +216,7 @@ Output valid JSON only. The first non-space character must be "{" and the last m
     {
       "id": "Q1",
       "time_hint": "",
-      "query_type": "ASR | OCR | Visual",
+      "query_type": "ASR | Visual",
       "query_text": "Short, keyword-rich, retrieval-friendly phrase packed with visual anchors",
       "why_this_query": "One short sentence explaining what needs verification or interpretation.",
       "needs_external_check": true,
@@ -233,7 +233,7 @@ Additional precision constraints for this run:
 - Set time_hint to "".
 - query_text must stay short, concrete, and easy to route downstream.
 - query_type must be one of:
-  ASR / OCR / Visual
+  ASR / Visual
 - Do not use Mixed.
 
 =====================
@@ -298,17 +298,17 @@ ASR query constraints
   - avoid putting disputed interpretation directly into query_text
 
 =====================
-OCR query constraints
+Text-in-visual constraints
 =====================
 
-- For OCR queries:
+- For text content visible on screen (title, subtitle, caption, slogan, banner text, logo text, stylized font):
+  - use query_type=Visual
   - prefer exact text phrases if explicitly present in the report
-  - if exact text is uncertain, use scene, object, or region anchors to help localize the right frame
-  - visual anchors are allowed and encouraged when they help locate the correct text region
+  - if exact text is uncertain, use scene, object, or region anchors to localize the right frame
   - prefer retrieval-friendly forms such as:
-    "text on banner above stage"
-    "headline text on screen"
-    "caption text in lower third of frame"
+    "headline text on screen during podium scene"
+    "banner text above stage with crowd below"
+    "caption text in lower third during close interaction"
 
 =====================
 Visual query constraints
@@ -535,9 +535,17 @@ class QueryRuntime:
 
 
 @dataclass
+class WhisperRuntime:
+    model: Any
+    device: str
+    model_path: str
+
+
+@dataclass
 class ModelRegistry:
     omni: OmniRuntime | None = None
     query: QueryRuntime | None = None
+    whisper: WhisperRuntime | None = None
 
 
 def build_global_understanding_prompt(user_focus: str = "") -> str:
@@ -925,6 +933,8 @@ def _normalize_single_query_item(
     query_type = normalize_query_type(
         str(coalesce_query_value(item, ["query_type", "type", "route"], default="Visual"))
     )
+    if query_type == "OCR":
+        query_type = "Visual"
 
     if not query_text:
         return None, f"retrieval_queries[{index}] missing usable query_text."
@@ -1104,6 +1114,39 @@ def _load_query_runtime(
     return QueryRuntime(model=model, tokenizer=tokenizer, device=device)
 
 
+def _resolve_whisper_device(device: str | None = None) -> str:
+    if device and str(device).strip():
+        return str(device).strip()
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _load_whisper_runtime(
+    whisper_model_path: str = DEFAULT_LOCALIZER_WHISPER_MODEL_PATH,
+    device: str | None = None,
+) -> WhisperRuntime:
+    print("\n" + "=" * 60)
+    print("模块 L-ASR：开始加载 Whisper 模型")
+    print("=" * 60)
+
+    resolved_device = _resolve_whisper_device(device)
+    model_path = str(Path(whisper_model_path))
+    if not Path(model_path).exists():
+        raise FileNotFoundError(f"Whisper model not found: {model_path}")
+
+    try:
+        import whisper
+    except Exception as exc:  # pragma: no cover - dependency guard
+        raise ImportError(
+            "Whisper runtime requires openai-whisper. Please install it before running localizer ASR."
+        ) from exc
+
+    print(f"whisper_model_path: {model_path}")
+    print(f"whisper_device: {resolved_device}")
+    model = whisper.load_model(model_path, device=resolved_device)
+    print("Whisper 模型加载完成")
+    return WhisperRuntime(model=model, device=resolved_device, model_path=model_path)
+
+
 def initialize_model_registry(
     omni_model_path: str,
     omni_device: str | None = None,
@@ -1111,6 +1154,9 @@ def initialize_model_registry(
     load_query: bool = False,
     query_model_path: str = "/sda/yuqifan/HFOCUS/Qwen3-4B",
     query_device: str | None = None,
+    load_whisper: bool = False,
+    whisper_model_path: str = DEFAULT_LOCALIZER_WHISPER_MODEL_PATH,
+    whisper_device: str | None = None,
 ) -> ModelRegistry:
     """统一预加载模型：默认可在一个阶段将 Omni / Query 一起加载。"""
     print("\n" + "=" * 60)
@@ -1128,6 +1174,12 @@ def initialize_model_registry(
         registry.query = _load_query_runtime(
             query_model_path=query_model_path,
             device=query_device,
+        )
+
+    if load_whisper:
+        registry.whisper = _load_whisper_runtime(
+            whisper_model_path=whisper_model_path,
+            device=whisper_device,
         )
 
     print("\n统一模型预加载完成")
@@ -1396,7 +1448,7 @@ def run_query_extraction(
             "Output one complete valid JSON object only. "
             "Use retrieval-friendly wording with strong visual anchors. "
             "Do not rely on speaker attribution or time hints. "
-            "Use query_type only from ASR, OCR, Visual. "
+            "Use query_type only from ASR, Visual. "
             f"Use key retrieval_queries only and at most {MAX_RETRIEVAL_QUERIES} items."
         ),
     )
@@ -1452,6 +1504,8 @@ def run_global_understanding_and_query_extraction(
     merge_max_continuations: int = 3,
     run_localizer: bool = False,
     localizer_config: dict[str, Any] | None = None,
+    localizer_whisper_model_path: str = DEFAULT_LOCALIZER_WHISPER_MODEL_PATH,
+    localizer_whisper_device: str | None = None,
     model_registry: ModelRegistry | None = None,
 ) -> GlobalPipelineResult:
     """总流程：模块 A 生成报告，再由模块 C 提炼 Query。"""
@@ -1465,6 +1519,9 @@ def run_global_understanding_and_query_extraction(
             load_query=True,
             query_model_path=query_model_path,
             query_device=query_device,
+            load_whisper=run_localizer,
+            whisper_model_path=localizer_whisper_model_path,
+            whisper_device=localizer_whisper_device,
         )
 
     report_text = run_global_video_understanding(
@@ -1506,6 +1563,7 @@ def run_global_understanding_and_query_extraction(
             video_path=video_path,
             retrieval_queries=query_result.retrieval_queries,
             config=localizer_cfg,
+            whisper_runtime=registry.whisper,
         )
 
     return GlobalPipelineResult(
@@ -1667,14 +1725,20 @@ def _build_localizer_config(
     device: str | None,
     batch_size: int,
     config_json: str | None,
+    whisper_model_path: str = DEFAULT_LOCALIZER_WHISPER_MODEL_PATH,
+    whisper_device: str | None = None,
 ) -> dict[str, Any]:
     from focus_localizer import default_config as focus_localizer_default_config
 
     cfg: dict[str, Any] = dict(focus_localizer_default_config)
     cfg["blip_model"] = blip_model
     cfg["batch_size"] = int(batch_size)
+    cfg["asr_backend"] = "whisper"
+    cfg["whisper_model_path"] = str(whisper_model_path)
     if device:
         cfg["device"] = device
+    if whisper_device:
+        cfg["whisper_device"] = str(whisper_device)
 
     if config_json:
         parsed = json.loads(config_json)
@@ -1689,8 +1753,9 @@ def run_query_evidence_localizer(
     video_path: str,
     retrieval_queries: list[RetrievalQuery] | list[dict[str, Any]],
     config: dict[str, Any],
+    whisper_runtime: WhisperRuntime | None = None,
 ) -> list[dict[str, Any]]:
-    from focus_localizer import localize_all_queries
+    from focus_localizer import build_openai_whisper_asr_infer_fn, localize_all_queries
 
     normalized_queries: list[dict[str, Any]] = []
     for q in retrieval_queries:
@@ -1699,10 +1764,21 @@ def run_query_evidence_localizer(
         elif isinstance(q, dict):
             normalized_queries.append(q)
 
+    cfg = dict(config or {})
+    cfg.setdefault("asr_backend", "whisper")
+    cfg.setdefault("whisper_model_path", DEFAULT_LOCALIZER_WHISPER_MODEL_PATH)
+    if whisper_runtime is not None and not callable(cfg.get("asr_infer_fn")):
+        cfg["asr_infer_fn"] = build_openai_whisper_asr_infer_fn(
+            whisper_model=whisper_runtime.model,
+            whisper_device=whisper_runtime.device,
+            whisper_model_path=whisper_runtime.model_path,
+        )
+        cfg.setdefault("whisper_device", whisper_runtime.device)
+
     return localize_all_queries(
         video_path=video_path,
         retrieval_queries=normalized_queries,
-        config=config,
+        config=cfg,
     )
 
 
@@ -1749,6 +1825,18 @@ if __name__ == "__main__":
         default=None,
         help="localizer 额外配置（JSON 对象字符串），用于覆盖默认短视频参数",
     )
+    parser.add_argument(
+        "--localizer_whisper_model",
+        type=str,
+        default=DEFAULT_LOCALIZER_WHISPER_MODEL_PATH,
+        help="localizer ASR 使用的 Whisper 模型路径（默认仓库内 Whisper/large-v3.pt）",
+    )
+    parser.add_argument(
+        "--localizer_whisper_device",
+        type=str,
+        default=None,
+        help="localizer Whisper 运行设备，如 cuda / cuda:0 / cpu",
+    )
 
     parser.add_argument("--disable_preload", action="store_true", help="禁用统一模型预加载（默认会在 A+C 模式预加载）")
 
@@ -1785,6 +1873,9 @@ if __name__ == "__main__":
             load_query=True,
             query_model_path=args.query_model,
             query_device=args.query_device,
+            load_whisper=args.run_localizer,
+            whisper_model_path=args.localizer_whisper_model,
+            whisper_device=args.localizer_whisper_device,
         )
 
     report = run_global_video_understanding(
@@ -1852,11 +1943,14 @@ if __name__ == "__main__":
                 device=args.localizer_device,
                 batch_size=args.localizer_batch_size,
                 config_json=args.localizer_config_json,
+                whisper_model_path=args.localizer_whisper_model,
+                whisper_device=args.localizer_whisper_device,
             )
             evidence_results = run_query_evidence_localizer(
                 video_path=args.video,
                 retrieval_queries=query_result.retrieval_queries,
                 config=localizer_cfg,
+                whisper_runtime=model_registry.whisper if model_registry else None,
             )
             localization_payload = {"evidence_results": evidence_results}
 
