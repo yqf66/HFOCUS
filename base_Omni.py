@@ -5,7 +5,9 @@ Qwen2.5-Omni 模块 A：全局视频理解（原生视频 + 音频）
 """
 
 import argparse
+import gc
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -27,6 +29,15 @@ from query_utils import coalesce_query_value, extract_query_list, normalize_quer
 
 MAX_RETRIEVAL_QUERIES = 5
 DEFAULT_LOCALIZER_WHISPER_MODEL_PATH = "/sda/yuqifan/HFOCUS/Whisper/large-v3.pt"
+DEFAULT_EVIDENCE_JUDGE_VL_MODEL_PATH = "/sda/yuqifan/HFOCUS/Qwen3-VL"
+DEFAULT_EVIDENCE_JUDGE_LLM_MODEL_PATH = "/sda/yuqifan/HFOCUS/Qwen3-4B"
+SMART_OMNI_MEMORY_UTILIZATION = 0.90
+SMART_OMNI_MEMORY_RESERVE_GIB = 2.0
+SMART_OMNI_MIN_GPU_BUDGET_GIB = 6.0
+OMNI_OOM_MAX_RETRIES = 2
+OMNI_OOM_FRAME_SCALE = 0.75
+OMNI_OOM_FPS_SCALE = 0.85
+OMNI_OOM_TOKEN_SCALE = 0.8
 
 
 GLOBAL_UNDERSTANDING_PROMPT = """
@@ -35,56 +46,104 @@ You are a multimodal video evidence analyst.
 Watch the video and produce a structured global understanding report
 optimized for downstream evidence retrieval and verification.
 
-Do NOT output JSON. Follow the exact format below strictly, as it will be parsed by later modules.
+Do NOT output JSON.
+Follow the exact format below strictly, as it will be parsed by later modules.
+
+=====================
+Core Goal:
+=====================
+
+Your job is NOT to make a final judgment.
+Your job is to build a careful, retrieval-oriented global understanding report that:
+1. summarizes the full video coherently,
+2. preserves important uncertainty,
+3. surfaces decision-relevant competing interpretations,
+4. identifies the highest-value points that need later verification.
 
 =====================
 Key Requirements:
 =====================
 
 1. Use both visual and audio evidence jointly.
+
 2. Separate observation and interpretation strictly:
-   - Use [Observed] for direct evidence
-   - Use [Inferred] for interpretation
+   - Use [Observed] only for directly visible / audible evidence.
+   - Use [Inferred] only for interpretation, explanation, or hypothesis.
+   - Do NOT mix them in the same bullet.
+
 3. Assign each key visual event an Event ID: E1, E2, E3...
-4. Unclear points MUST explicitly reference related Event IDs.
-5. Do NOT output timestamps or phase labels anywhere.
+   - Use a small number of salient events rather than many trivial ones.
+   - Prefer events that matter for later verification, ambiguity resolution, or final judgment.
 
-6. [CRITICAL AUDIO-VISUAL FIREWALL]: Do NOT treat on-screen text as spoken audio (ASR).
-   - If text is printed on screen but not audibly spoken by a real voice, it MUST NOT appear in the [Speech Transcript] section.
-   - Do NOT use visual context to guess missing spoken words.
+4. Do not overcommit to a single interpretation when important context is missing.
+   - If the same observed event could support multiple meaningful readings, keep the main interpretation cautious.
+   - Explicitly surface a genuinely competing explanation when appropriate.
 
-7. [MANDATORY ENTITY EXTRACTION]: You must actively scan for and explicitly document high-value visual entities across various domains. Pay special attention to:
+5. [CRITICAL AUDIO-VISUAL FIREWALL]:
+   - Do NOT treat on-screen text as spoken audio.
+   - If text appears visually but is not audibly spoken by a real voice, it MUST NOT appear in [Speech Transcript].
+   - Do NOT use visual context to fill in missing spoken words.
+   - Do NOT convert subtitles, captions, slogans, OCR text, or memes into speech.
+   
+6. [ON-SCREEN TEXT EXTRACTION]:
+   - Actively scan for any visible on-screen text across the whole video.
+   - This includes subtitles, captions, overlays, memes, UI text, signs, posters, banners, labels, logos with readable words, printed text on clothing/objects, and other readable visual text.
+   - Report text that may help later retrieval, verification, interpretation, or final judgment.
+   - Quote the exact visible wording when readable.
+   - If partially readable, quote only the reliable part and mark the rest as [unclear].
+   - Do NOT treat on-screen text as spoken audio unless it is actually heard.
+   - If no visible text is observed, write: No On-Screen Text Observed.
+
+7. [MANDATORY ENTITY EXTRACTION]:
+   You must actively scan for and explicitly document high-value visible entities across domains.
+   Pay special attention to:
    - National, regional, or international flags and emblems.
-   - Religious, ideological, or organizational symbols and insignias.
-   - Political logos, campaign merchandise, protest signs, or distinct uniform patches.
-   - Recognizable public figures, leader lookalikes, impersonations, parodies, or heavy imitation makeup/costume.
-   - [UNKNOWN SALIENT FIGURES]: If a person appears to imitate or resemble a real public figure, BUT you cannot identify them confidently, label them as [Unidentified Key Figure] and describe their distinctive face, hair, costume, and accessories.
+   - Religious, ideological, political, military, or organizational symbols / insignias.
+   - Protest signs, slogans, campaign merchandise, distinct patches, uniforms, badges, armbands, salutes, portraits, or banners.
+   - Recognizable public figures, leader lookalikes, impersonations, parodies, or heavy imitation makeup / costume.
+   - If a person appears to imitate or resemble a real public figure, BUT you cannot identify them confidently, label them as [Unidentified Key Figure] and describe the visible cues neutrally.
    - If identity or symbol significance is uncertain but potentially important, still report it neutrally rather than omitting it.
 
 8. Very important for speech transcription:
    - Transcribe as much spoken wording as you can across the whole video.
-   - Prioritize fuller transcription over short fragments when the speech is reasonably audible.
-   - Do NOT paraphrase speech.
+   - Prioritize fuller transcription over short fragments when speech is reasonably audible.
+   - Do NOT paraphrase.
    - Do NOT summarize speech inside the transcript section.
-   - Do NOT infer missing words from visual context.
    - Do NOT use speaker labels or speaker attribution.
-   - If a few words are uncertain, omit only those words and keep the surrounding audible words.
-   - Use `none reliable` only if there is truly no usable spoken content in the video.
+   - If a short part is uncertain, omit only that small part and keep the surrounding audible words.
+   - Use `none reliable` only if there is truly no usable spoken content anywhere in the video.
+
+9. For [Scene] and [Full Video Narrative], stay cautious and evidence-grounded.
+   - Do NOT assign strong moral, legal, or political roles unless directly supported.
+   - Do NOT smooth over major ambiguities just to make the video story more coherent.
+
+10. [Alternative Interpretation] must be genuinely decision-relevant.
+   - It must present a competing explanation that could materially change downstream verification or final judgment.
+   - Do NOT merely restate the main interpretation in weaker or vaguer wording.
+
+11. [Key Unclear Points] must prioritize high-impact uncertainty.
+   - Focus on uncertainties that most affect later retrieval, verification, classification, or answer quality.
+   - Prefer unclear points that distinguish the main interpretation from the alternative interpretation.
+   - Each unclear point should identify what is missing and what kind of evidence would help resolve it.
+   - Unclear points may concern a single event, multiple events, cross-modal relations, or broader scene-level ambiguity.
+   - When helpful, you may mention which observed evidence the uncertainty is most related to, but do not force every unclear point to attach to a single event.
+   
 
 =====================
 Output Format:
 =====================
 
 [Scene]
-- setting: ...
-- people: ...
-- roles: ...
-- high-value entities: [List any visible flags, logos, patches, symbols, slogans, salutes, portraits, or recognizable / possibly recognizable figures based on Requirement 7. For each item, include a short category tag such as [symbol], [identity-candidate], [organization], [slogan], [unknown], plus a neutral visible description. Write "None" if none are observed]
-- context: ...
+- setting: describe the visible environment or setting neutrally
+- people: describe the visible people or characters neutrally. For each important person / character, include stable visual attributes useful for later retrieval, such as clothing, accessories, hairstyle, facial hair, apparent age group, apparent skin tone / perceived ethnicity when visually inferable, and other distinctive visible cues. Use cautious wording when uncertain.
+- roles: cautiously describe likely social or interaction roles based on visible evidence; avoid strong moral, legal, or political role assignments unless directly supported
+- high-value entities: [List any visible flags, logos, patches, symbols, slogans, salutes, portraits, uniforms, banners, or recognizable / possibly recognizable figures based on Requirement 8. For each item, include a short category tag such as [symbol], [identity-candidate], [organization], [slogan], [uniform-marker], [unknown], plus a neutral visible description. Write "None" if none are observed.]
+- context: a cautious high-level situational context based only on supported evidence
 
 [Full Video Narrative]
-- one concise paragraph describing the full video flow from beginning to ending
-- focus on interaction changes and key transitions
+- one concise paragraph describing the overall video flow in a coherent but cautious way
+- focus on the most important interactions, transitions, and evidence-relevant developments
+- do not smooth over major ambiguities just to make the narrative more complete
 
 [Observed Visual Events]
 
@@ -101,30 +160,36 @@ E3:
 - "..."
 - "..."
 - include spoken wording only
-- do NOT add speaker labels
-- do NOT add timestamps
 - do NOT paraphrase
 - if a short part is uncertain, omit only that small part and keep the rest
 - if no reliable speech is audible anywhere, write: none reliable
 
+[On-screen Text]
+- ...
+- ...
+- If no visible on-screen text is observed, write: No On-Screen Text Observed
+
 [Main Interpretation]
-- [Inferred] the most likely explanation of what is happening
+- [Inferred] the most likely explanation of what is happening, written cautiously and grounded in the observed evidence
 
 [Alternative Interpretation]
-- [Inferred] provide a second plausible explanation from another angle
+- [Inferred] a genuinely competing explanation that could change downstream verification or final judgment
+- [Inferred] when possible, indicate what kind of missing evidence would help distinguish it from the main interpretation
 
 [Key Unclear Points]
 
-U1 (related to E2):
+U1:
 - what is unclear:
+- why it matters:
 - what needs verification:
 
-U2 (related to E3):
+U2:
 - what is unclear:
+- why it matters:
 - what needs verification:
 
 [Preliminary Conclusion]
-- [Inferred] cautious summary
+- [Inferred] a cautious summary of the current best understanding without making a final categorical judgment
 - confidence: low / medium / high
 """
 
@@ -365,48 +430,108 @@ Style constraints
 """
 
 
-SEGMENT_MERGE_PROMPT = """You are a senior video-analysis synthesis assistant.
+SEGMENT_MERGE_PROMPT = """You are a multimodal video evidence synthesis assistant.
 
 You will receive multiple overlapping segment reports generated from the same video.
-Your task is to merge them into ONE coherent full-video report.
+Your task is to merge them into ONE structured full-video report optimized for downstream evidence retrieval and verification.
 
-Rules:
-1. Preserve chronology strictly from beginning to ending.
-2. Deduplicate repeated content caused by segment overlap.
-3. Keep unique details; do not drop rare but important evidence.
-4. If segment reports conflict, keep both possibilities and mark uncertainty.
-5. Use both visual and audio evidence.
-6. Do NOT output timestamps or phase labels.
-7. Do NOT output JSON.
-8. Separate direct evidence from interpretation strictly:
-   - Use [Observed] for direct evidence
-   - Use [Inferred] for interpretation
-9. Do NOT let visual context fill in missing audio words.
-10. In the transcript section, preserve spoken wording rather than paraphrasing.
-11. Do NOT treat on-screen text as spoken audio unless it is actually heard.
-12. When merging overlapping audio evidence:
-   - keep the fullest reliable wording
-   - avoid duplicate transcript lines caused by overlap
-   - do not use speaker labels
-13. Preserve high-value entities and external-check candidates:
-   - do not drop uncertain but salient identities, symbols, slogans, patches, logos, gestures, or portraits
-   - pay special attention to public-figure lookalikes, impersonations, imitation makeup/costume, and politically or historically meaningful symbols
-   - keep them neutrally described if recognition is uncertain
+Do NOT output JSON.
+Follow the exact format below strictly, as it will be parsed by later modules.
+
+=====================
+Core Goal:
+=====================
+
+Your job is NOT to make a final judgment.
+Your job is to build a careful, retrieval-oriented merged report that:
+1. preserves the important evidence from all segment reports,
+2. deduplicates overlap without dropping rare but important details,
+3. keeps important uncertainty explicit,
+4. surfaces decision-relevant competing interpretations,
+5. retains the highest-value points for later verification.
+
+=====================
+Key Requirements:
+=====================
+
+1. Use both visual and audio evidence jointly.
+
+2. Separate observation and interpretation strictly:
+   - Use [Observed] only for directly visible / audible evidence.
+   - Use [Inferred] only for interpretation, explanation, or hypothesis.
+   - Do NOT mix them in the same bullet.
+
+3. Assign each key merged visual event an Event ID: E1, E2, E3...
+   - Do NOT omit an event if it carries important uncertainty, ambiguity, or competing interpretation.
+   - Prefer salient events that matter for later verification, uncertainty identification, or competing interpretations.
+   - When overlapping segment reports describe the same event, merge them carefully.
+   - When reports may describe different events, do NOT collapse them prematurely.
+
+4. Do not overcommit to a single interpretation when important context is missing.
+   - If the same observed evidence could support multiple meaningful readings, keep the main interpretation cautious.
+   - Explicitly surface a genuinely competing explanation when appropriate.
+
+5. [MANDATORY ENTITY PRESERVATION]:
+   You must actively preserve and merge high-value visible entities across segment reports.
+   Pay special attention to:
+   - National, regional, or international flags and emblems.
+   - Religious, ideological, political, military, or organizational symbols / insignias.
+   - Protest signs, slogans, campaign merchandise, distinct patches, uniforms, badges, armbands, salutes, portraits, or banners.
+   - Recognizable public figures, leader lookalikes, impersonations, parodies, or heavy imitation makeup / costume.
+   - If a person appears to imitate or resemble a real public figure, BUT identification is uncertain, label them as [Unidentified Key Figure] and describe the visible cues neutrally.
+   - If identity or symbol significance is uncertain but potentially important, still preserve it neutrally rather than omitting it.
+
+6. Very important for speech transcription:
+   - Preserve as much spoken wording as possible across all segments.
+   - Prioritize fuller transcription over short fragments when speech is reasonably audible.
+   - Do NOT paraphrase.
+   - Do NOT summarize speech inside the transcript section.
+   - Do NOT use speaker labels or speaker attribution.
+   - If a short part is uncertain, omit only that small part and keep the surrounding audible words.
+   - Use `none reliable` only if there is truly no usable spoken content anywhere in the full video.
+
+7. [SPECIAL MERGE RULE: Speech Transcript]
+   - Treat [Speech Transcript] as evidence-preservation-first.
+   - Prefer direct concatenation / retention of transcript lines from segment reports rather than semantic rewriting.
+   - Remove only clear duplicates caused by overlap.
+   - If two lines are similar but not clearly identical, keep both rather than risk losing information.
+   - Do NOT compress multiple transcript lines into a summary sentence.
+
+8. For [Scene] and [Full Video Narrative], stay cautious and evidence-grounded.
+   - Do NOT assign strong moral, legal, or political roles unless directly supported.
+   - Do NOT smooth over major ambiguities just to make the video story more coherent.
+
+9. [Alternative Interpretation] must be genuinely decision-relevant.
+   - It must present a competing explanation that could materially change downstream verification or final judgment.
+   - Do NOT merely restate the main interpretation in weaker or vaguer wording.
+
+10. [SPECIAL MERGE RULE: Key Unclear Points]
+   - Treat [Key Unclear Points] as uncertainty-preservation-first.
+   - Prefer direct retention / light consolidation of unclear points from segment reports rather than aggressive semantic merging.
+   - If two unclear points appear related but target different events, evidence types, or verification needs, keep both.
+   - Do NOT remove an unclear point just because another point sounds more general.
+   - Only merge items when they are clearly the same uncertainty.
+
+11. When segment reports conflict:
+   - keep both supported possibilities if the conflict cannot be resolved from the available reports,
+   - mark uncertainty clearly,
+   - do NOT force a single clean story at the cost of losing evidence.
 
 =====================
 Output Format:
 =====================
 
 [Scene]
-- setting: ...
-- people: ...
-- roles: ...
-- high-value entities: ...
-- context: ...
+- setting: describe the visible environment or setting neutrally
+- people: describe the visible people or characters neutrally
+- roles: cautiously describe likely social or interaction roles based on visible evidence; avoid strong moral, legal, or political role assignments unless directly supported
+- high-value entities: [List any visible flags, logos, patches, symbols, slogans, salutes, portraits, uniforms, banners, or recognizable / possibly recognizable figures based on Requirement 8. For each item, include a short category tag such as [symbol], [identity-candidate], [organization], [slogan], [uniform-marker], [unknown], plus a neutral visible description. Write "None" if none are observed.]
+- context: a cautious high-level situational context based only on supported evidence
 
 [Full Video Narrative]
-- one concise paragraph describing the full video flow from beginning to ending
-- focus on interaction changes and key transitions
+- one concise paragraph describing the overall video flow in a coherent but cautious way
+- focus on the most important interactions, transitions, and evidence-relevant developments
+- do not smooth over major ambiguities just to make the narrative more complete
 
 [Observed Visual Events]
 
@@ -423,30 +548,34 @@ E3:
 - "..."
 - "..."
 - include spoken wording only
+- do NOT paraphrase
 - do NOT add speaker labels
 - do NOT add timestamps
-- do NOT paraphrase
 - if a short part is uncertain, omit only that small part and keep the rest
+- preserve overlapping segment evidence conservatively
 - if no reliable speech is audible anywhere, write: none reliable
 
 [Main Interpretation]
-- [Inferred] the most likely explanation of what is happening
+- [Inferred] the most likely explanation of what is happening, written cautiously and grounded in the observed evidence
 
 [Alternative Interpretation]
-- [Inferred] provide a second plausible explanation from another angle
+- [Inferred] a genuinely competing explanation that could change downstream verification or final judgment
+- [Inferred] when possible, indicate what kind of missing evidence would help distinguish it from the main interpretation
 
 [Key Unclear Points]
 
-U1 (related to E2):
+U1:
 - what is unclear:
+- why it matters:
 - what needs verification:
 
-U2 (related to E3):
+U2:
 - what is unclear:
+- why it matters:
 - what needs verification:
 
 [Preliminary Conclusion]
-- [Inferred] cautious summary
+- [Inferred] a cautious summary of the current best understanding without making a final categorical judgment
 - confidence: low / medium / high
 """
 
@@ -468,7 +597,6 @@ _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 @dataclass
 class RetrievalQuery:
     id: str
-    time_hint: str
     query_type: str
     query_text: str
     why_this_query: str
@@ -477,7 +605,6 @@ class RetrievalQuery:
     def to_output_dict(self) -> dict[str, Any]:
         payload = {
             "id": self.id,
-            "time_hint": self.time_hint,
             "query_type": self.query_type,
             "query_text": self.query_text,
             "why_this_query": self.why_this_query,
@@ -509,12 +636,14 @@ class GlobalPipelineResult:
     report_text: str
     query_result: QueryExtractionResult
     evidence_results: list[dict[str, Any]] | None = None
+    evidence_judge_result: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "report_text": self.report_text,
             "query_result": self.query_result.to_dict(),
             "evidence_results": self.evidence_results,
+            "evidence_judge_result": self.evidence_judge_result,
         }
 
 
@@ -546,6 +675,7 @@ class ModelRegistry:
     omni: OmniRuntime | None = None
     query: QueryRuntime | None = None
     whisper: WhisperRuntime | None = None
+    evidence_judge_vl: Any | None = None
 
 
 def build_global_understanding_prompt(user_focus: str = "") -> str:
@@ -875,6 +1005,116 @@ def _get_module_device(module: torch.nn.Module) -> torch.device | None:
     return None
 
 
+def _bytes_to_gib(num_bytes: int) -> float:
+    return float(num_bytes) / float(1024**3)
+
+
+def _format_gib(num_gib: float) -> str:
+    return f"{num_gib:.2f} GiB"
+
+
+def _collect_cuda_memory_stats() -> list[dict[str, Any]]:
+    stats: list[dict[str, Any]] = []
+    if not torch.cuda.is_available():
+        return stats
+
+    n_gpu = torch.cuda.device_count()
+    for idx in range(n_gpu):
+        props = torch.cuda.get_device_properties(idx)
+        total_bytes = int(props.total_memory)
+        try:
+            with torch.cuda.device(idx):
+                free_bytes, _ = torch.cuda.mem_get_info()
+            free_bytes = int(free_bytes)
+        except Exception:
+            reserved = int(torch.cuda.memory_reserved(idx))
+            free_bytes = max(0, total_bytes - reserved)
+        allocated_bytes = int(torch.cuda.memory_allocated(idx))
+        reserved_bytes = int(torch.cuda.memory_reserved(idx))
+        stats.append(
+            {
+                "index": idx,
+                "name": props.name,
+                "total_bytes": total_bytes,
+                "free_bytes": free_bytes,
+                "allocated_bytes": allocated_bytes,
+                "reserved_bytes": reserved_bytes,
+            }
+        )
+    return stats
+
+
+def _print_cuda_memory_snapshot(title: str = "当前 CUDA 显存快照") -> list[dict[str, Any]]:
+    stats = _collect_cuda_memory_stats()
+    if not stats:
+        return stats
+
+    print(f"[显存] {title}")
+    for item in stats:
+        idx = int(item["index"])
+        print(
+            f"  - cuda:{idx} ({item['name']}): "
+            f"free={_format_gib(_bytes_to_gib(int(item['free_bytes'])))} / "
+            f"total={_format_gib(_bytes_to_gib(int(item['total_bytes'])))} | "
+            f"allocated={_format_gib(_bytes_to_gib(int(item['allocated_bytes'])))} | "
+            f"reserved={_format_gib(_bytes_to_gib(int(item['reserved_bytes'])))}"
+        )
+    return stats
+
+
+def _pick_most_free_cuda_device(min_free_gib: float = 0.0) -> str | None:
+    stats = _collect_cuda_memory_stats()
+    if not stats:
+        return None
+    best = max(stats, key=lambda x: int(x["free_bytes"]))
+    best_free_gib = _bytes_to_gib(int(best["free_bytes"]))
+    if best_free_gib < float(min_free_gib):
+        return None
+    return f"cuda:{int(best['index'])}"
+
+
+def _build_smart_max_memory(
+    memory_stats: list[dict[str, Any]],
+    utilization: float = SMART_OMNI_MEMORY_UTILIZATION,
+    reserve_gib: float = SMART_OMNI_MEMORY_RESERVE_GIB,
+    min_budget_gib: float = SMART_OMNI_MIN_GPU_BUDGET_GIB,
+) -> dict[int | str, str]:
+    if not memory_stats:
+        return {}
+
+    raw_budgets: list[tuple[int, float]] = []
+    for item in memory_stats:
+        idx = int(item["index"])
+        free_gib = _bytes_to_gib(int(item["free_bytes"]))
+        total_gib = _bytes_to_gib(int(item["total_bytes"]))
+        budget_gib = max(0.0, free_gib * float(utilization) - float(reserve_gib))
+        budget_gib = min(budget_gib, max(0.0, total_gib - 1.0))
+        if budget_gib >= float(min_budget_gib):
+            raw_budgets.append((idx, budget_gib))
+
+    if not raw_budgets:
+        return {}
+
+    avg_budget = sum(b for _, b in raw_budgets) / float(len(raw_budgets))
+    max_per_gpu = max(4.0, avg_budget * 1.10)
+
+    max_memory: dict[int | str, str] = {}
+    for idx, raw_budget in raw_budgets:
+        balanced_budget = min(raw_budget, max_per_gpu)
+        rounded_budget = max(4, int(balanced_budget))
+        max_memory[idx] = f"{rounded_budget}GiB"
+
+    max_memory["cpu"] = "64GiB"
+    return max_memory
+
+
+def _resolve_best_cuda_device_or_default(default: str = "cuda:0") -> str:
+    best = _pick_most_free_cuda_device()
+    if best is not None:
+        return best
+    return default
+
+
 def _get_query_dtype(device: str) -> torch.dtype:
     """根据设备为 Query 文本模型选择 dtype。"""
     if str(device).startswith("cuda"):
@@ -915,7 +1155,6 @@ def _normalize_single_query_item(
     index: int,
 ) -> tuple[RetrievalQuery | None, str | None]:
     qid = str(coalesce_query_value(item, ["id", "query_id"], default=f"Q{index + 1}")).strip() or f"Q{index + 1}"
-    time_hint = str(coalesce_query_value(item, ["time_hint", "time", "phase_hint"], default="")).strip()
     query_text = str(
         coalesce_query_value(
             item,
@@ -942,9 +1181,6 @@ def _normalize_single_query_item(
     known_core_keys = {
         "id",
         "query_id",
-        "time_hint",
-        "time",
-        "phase_hint",
         "query_type",
         "type",
         "route",
@@ -959,6 +1195,16 @@ def _normalize_single_query_item(
         "why",
     }
     extra_fields = {k: v for k, v in item.items() if k not in known_core_keys}
+    for legacy_key in list(extra_fields.keys()):
+        lowered = legacy_key.strip().lower()
+        if lowered == "time":
+            extra_fields.pop(legacy_key, None)
+            continue
+        if "time" in lowered and "hint" in lowered:
+            extra_fields.pop(legacy_key, None)
+            continue
+        if lowered.startswith("phase") and "hint" in lowered:
+            extra_fields.pop(legacy_key, None)
 
     extra_fields["needs_external_check"] = to_bool(item.get("needs_external_check"), default=False)
     extra_fields["external_check_focus"] = str(item.get("external_check_focus", "") or "").strip()
@@ -967,7 +1213,6 @@ def _normalize_single_query_item(
     return (
         RetrievalQuery(
             id=qid,
-            time_hint=time_hint,
             query_type=query_type,
             query_text=query_text,
             why_this_query=why_this_query,
@@ -1014,17 +1259,24 @@ def _load_omni_runtime(
     device_map: str | None = "auto",
 ) -> OmniRuntime:
     print("=" * 60)
-    print("模块 A：加载模型")
+    print("加载模型")
     print("=" * 60)
 
     n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
     if device is None and n_gpu > 0:
-        device = "cuda:0"
+        device = _resolve_best_cuda_device_or_default("cuda:0")
     elif device is None:
         device = "cpu"
 
+    if str(device).startswith("cuda") and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        print("[提示] 已设置 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
+
     model_dtype = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
     effective_device_map = device_map
+    if n_gpu > 1 and str(device_map).lower() == "auto":
+        # 多卡推理时优先给首卡留出更多激活空间，降低 generate 阶段 OOM 风险。
+        effective_device_map = "balanced_low_0"
     model_load_kwargs = {
         "torch_dtype": model_dtype,
         "attn_implementation": "sdpa",
@@ -1032,10 +1284,19 @@ def _load_omni_runtime(
     if effective_device_map not in (None, "none"):
         model_load_kwargs["device_map"] = effective_device_map
 
+    smart_max_memory: dict[int | str, str] | None = None
+    if n_gpu > 1 and effective_device_map not in (None, "none"):
+        memory_stats = _print_cuda_memory_snapshot("Omni 加载前")
+        smart_max_memory = _build_smart_max_memory(memory_stats)
+        if smart_max_memory:
+            model_load_kwargs["max_memory"] = smart_max_memory
+
     print(f"模型路径: {model_path}")
     print(f"device: {device}")
     print(f"device_map: {effective_device_map}")
     print(f"可见 GPU 数: {n_gpu}")
+    if smart_max_memory:
+        print(f"智能 max_memory: {smart_max_memory}")
 
     model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
         model_path,
@@ -1070,12 +1331,12 @@ def _load_query_runtime(
     device: str | None = None,
 ) -> QueryRuntime:
     print("\n" + "=" * 60)
-    print("模块 C：开始加载 Query 模型")
+    print("开始加载 Query 模型")
     print("=" * 60)
 
     n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
     if device is None and n_gpu > 0:
-        device = "cuda:0"
+        device = _resolve_best_cuda_device_or_default("cuda:0")
     elif device is None:
         device = "cpu"
 
@@ -1117,7 +1378,9 @@ def _load_query_runtime(
 def _resolve_whisper_device(device: str | None = None) -> str:
     if device and str(device).strip():
         return str(device).strip()
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        return _resolve_best_cuda_device_or_default("cuda:0")
+    return "cpu"
 
 
 def _load_whisper_runtime(
@@ -1125,7 +1388,7 @@ def _load_whisper_runtime(
     device: str | None = None,
 ) -> WhisperRuntime:
     print("\n" + "=" * 60)
-    print("模块 L-ASR：开始加载 Whisper 模型")
+    print("开始加载 Whisper 模型")
     print("=" * 60)
 
     resolved_device = _resolve_whisper_device(device)
@@ -1186,6 +1449,100 @@ def initialize_model_registry(
     return registry
 
 
+def _release_omni_runtime(registry: ModelRegistry | None) -> None:
+    if registry is None or registry.omni is None:
+        return
+
+    print("\n" + "=" * 60)
+    print("进入证据分析阶段：释放 Omni 模型以回收显存")
+    print("=" * 60)
+    _print_cuda_memory_snapshot("释放 Omni 前")
+
+    runtime = registry.omni
+    registry.omni = None
+    try:
+        model = runtime.model
+        processor = runtime.processor
+        del model
+        del processor
+    except Exception:
+        pass
+    del runtime
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    _print_cuda_memory_snapshot("释放 Omni 后")
+
+
+def _get_or_load_evidence_judge_vl_runtime(
+    registry: ModelRegistry | None,
+    model_path: str,
+    device: str | None,
+) -> Any:
+    if registry is not None and registry.evidence_judge_vl is not None:
+        print("[提示] 使用已缓存 evidence_judge Qwen3-VL runtime")
+        return registry.evidence_judge_vl
+
+    from evidence_judge_pipeline import _load_vl_runtime
+
+    print("\n" + "=" * 60)
+    print("加载 evidence_judge Qwen3-VL 模型")
+    print("=" * 60)
+    runtime = _load_vl_runtime(model_path=model_path, device=device)
+    if registry is not None:
+        registry.evidence_judge_vl = runtime
+    return runtime
+
+
+def _is_cuda_oom_error(exc: BaseException) -> bool:
+    if isinstance(exc, torch.OutOfMemoryError):
+        return True
+    message = str(exc).lower()
+    return "cuda out of memory" in message or "out of memory" in message
+
+
+def _shrink_sampling_after_oom(
+    fps: float,
+    min_frames: int,
+    max_frames: int,
+    nframes: int | None,
+    generation_tokens: int,
+) -> tuple[float, int, int, int | None, int, bool]:
+    changed = False
+
+    if nframes is not None:
+        next_nframes = max(4, int(round(float(nframes) * OMNI_OOM_FRAME_SCALE)))
+        if next_nframes < int(nframes):
+            nframes = next_nframes
+            changed = True
+    else:
+        next_max_frames = max(16, int(round(float(max_frames) * OMNI_OOM_FRAME_SCALE)))
+        if next_max_frames < int(max_frames):
+            max_frames = next_max_frames
+            changed = True
+
+        next_min_frames = max(4, min(int(min_frames), max_frames))
+        if next_min_frames > max_frames:
+            next_min_frames = max_frames
+        if next_min_frames < int(min_frames):
+            min_frames = next_min_frames
+            changed = True
+
+        next_fps = max(0.2, float(fps) * OMNI_OOM_FPS_SCALE)
+        if next_fps < float(fps):
+            fps = next_fps
+            changed = True
+
+    next_generation_tokens = max(128, int(round(float(generation_tokens) * OMNI_OOM_TOKEN_SCALE)))
+    if next_generation_tokens < int(generation_tokens):
+        generation_tokens = next_generation_tokens
+        changed = True
+
+    return fps, min_frames, max_frames, nframes, generation_tokens, changed
+
+
 def run_global_video_understanding(
     video_path: str,
     user_focus: str = "",
@@ -1239,86 +1596,135 @@ def run_global_video_understanding(
     effective_fps = max(0.1, float(video_fps))
 
     def _run_omni_for_range(start_sec: float, end_sec: float | None, is_segment: bool) -> str:
-        video_item: dict[str, Any] = {
-            "type": "video",
-            "video": video_path,
-            "video_start": float(start_sec),
-        }
-        if end_sec is not None:
-            video_item["video_end"] = float(end_sec)
-        if video_nframes is not None:
-            video_item["nframes"] = max(4, int(video_nframes))
-        else:
-            video_item["fps"] = effective_fps
-            video_item["min_frames"] = effective_min_frames
-            video_item["max_frames"] = effective_max_frames
+        attempt_fps = effective_fps
+        attempt_min_frames = effective_min_frames
+        attempt_max_frames = effective_max_frames
+        attempt_nframes = max(4, int(video_nframes)) if video_nframes is not None else None
+        attempt_max_new_tokens = max_new_tokens
 
-        user_prompt = build_global_understanding_prompt(user_focus)
-        if is_segment and end_sec is not None:
-            user_prompt = (
-                f"[Global video range] {_format_hhmmss(full_start)} - {_format_hhmmss(full_end)}\n"
-                f"[Current segment] {_format_hhmmss(start_sec)} - {_format_hhmmss(end_sec)}\n"
-                "Analyze only current segment but keep chronology awareness.\n\n"
-                f"{user_prompt}"
-            )
+        for attempt in range(1, OMNI_OOM_MAX_RETRIES + 2):
+            video_item: dict[str, Any] = {
+                "type": "video",
+                "video": video_path,
+                "video_start": float(start_sec),
+            }
+            if end_sec is not None:
+                video_item["video_end"] = float(end_sec)
+            if attempt_nframes is not None:
+                video_item["nframes"] = max(4, int(attempt_nframes))
+            else:
+                video_item["fps"] = float(attempt_fps)
+                video_item["min_frames"] = max(1, int(attempt_min_frames))
+                video_item["max_frames"] = max(int(attempt_min_frames), int(attempt_max_frames))
 
-        conversation = [
-            {
-                "role": "system",
-                "content": [{"type": "text", "text": system_prompt}],
-            },
-            {
-                "role": "user",
-                "content": [
-                    video_item,
-                    {"type": "text", "text": user_prompt},
-                ],
-            },
-        ]
+            user_prompt = build_global_understanding_prompt(user_focus)
+            if is_segment and end_sec is not None:
+                user_prompt = (
+                    f"[Global video range] {_format_hhmmss(full_start)} - {_format_hhmmss(full_end)}\n"
+                    f"[Current segment] {_format_hhmmss(start_sec)} - {_format_hhmmss(end_sec)}\n"
+                    "Analyze only current segment but keep chronology awareness.\n\n"
+                    f"{user_prompt}"
+                )
 
-        text = runtime.processor.apply_chat_template(
-            conversation, add_generation_prompt=True, tokenize=False
-        )
-        audios, images, videos = process_mm_info(
-            conversation, use_audio_in_video=runtime.use_audio_in_video
-        )
+            conversation = [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": system_prompt}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        video_item,
+                        {"type": "text", "text": user_prompt},
+                    ],
+                },
+            ]
 
-        inputs = runtime.processor(
-            text=text,
-            audio=audios,
-            images=images,
-            videos=videos,
-            return_tensors="pt",
-            padding=True,
-            use_audio_in_video=runtime.use_audio_in_video,
-        )
-        for key, value in inputs.items():
-            if not torch.is_tensor(value):
-                continue
-            value = value.to(runtime.input_device)
-            if value.is_floating_point():
-                value = value.to(runtime.model_dtype)
-            inputs[key] = value
+            try:
+                text = runtime.processor.apply_chat_template(
+                    conversation, add_generation_prompt=True, tokenize=False
+                )
+                audios, images, videos = process_mm_info(
+                    conversation, use_audio_in_video=runtime.use_audio_in_video
+                )
 
-        output_ids = runtime.model.generate(
-            **inputs,
-            use_audio_in_video=runtime.use_audio_in_video,
-            return_audio=False,
-            max_new_tokens=max_new_tokens,
-        )
-        input_ids = inputs.get("input_ids")
-        if torch.is_tensor(input_ids) and output_ids.shape[1] >= input_ids.shape[1]:
-            generated_ids = output_ids[:, input_ids.shape[1] :]
-        else:
-            generated_ids = output_ids
+                inputs = runtime.processor(
+                    text=text,
+                    audio=audios,
+                    images=images,
+                    videos=videos,
+                    return_tensors="pt",
+                    padding=True,
+                    use_audio_in_video=runtime.use_audio_in_video,
+                )
+                for key, value in inputs.items():
+                    if not torch.is_tensor(value):
+                        continue
+                    value = value.to(runtime.input_device)
+                    if value.is_floating_point():
+                        value = value.to(runtime.model_dtype)
+                    inputs[key] = value
 
-        decoded = runtime.processor.batch_decode(
-            generated_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )
-        raw_text = decoded[0].strip() if isinstance(decoded, list) and decoded else str(decoded).strip()
-        return _postprocess_report_text(raw_text)
+                output_ids = runtime.model.generate(
+                    **inputs,
+                    use_audio_in_video=runtime.use_audio_in_video,
+                    return_audio=False,
+                    max_new_tokens=int(attempt_max_new_tokens),
+                )
+                input_ids = inputs.get("input_ids")
+                if torch.is_tensor(input_ids) and output_ids.shape[1] >= input_ids.shape[1]:
+                    generated_ids = output_ids[:, input_ids.shape[1] :]
+                else:
+                    generated_ids = output_ids
+
+                decoded = runtime.processor.batch_decode(
+                    generated_ids,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+                raw_text = decoded[0].strip() if isinstance(decoded, list) and decoded else str(decoded).strip()
+                return _postprocess_report_text(raw_text)
+            except Exception as exc:
+                if not _is_cuda_oom_error(exc) or attempt > OMNI_OOM_MAX_RETRIES:
+                    raise
+
+                print(
+                    f"[OOM保护] 段推理触发显存不足，准备重试 {attempt + 1}/{OMNI_OOM_MAX_RETRIES + 1}。"
+                )
+                _print_cuda_memory_snapshot("OOM 触发时")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+
+                (
+                    attempt_fps,
+                    attempt_min_frames,
+                    attempt_max_frames,
+                    attempt_nframes,
+                    attempt_max_new_tokens,
+                    changed,
+                ) = _shrink_sampling_after_oom(
+                    fps=attempt_fps,
+                    min_frames=attempt_min_frames,
+                    max_frames=attempt_max_frames,
+                    nframes=attempt_nframes,
+                    generation_tokens=attempt_max_new_tokens,
+                )
+                if not changed:
+                    raise
+
+                if attempt_nframes is not None:
+                    print(
+                        f"[OOM保护] 降采样: nframes={attempt_nframes}, max_new_tokens={attempt_max_new_tokens}"
+                    )
+                else:
+                    print(
+                        "[OOM保护] 降采样: "
+                        f"fps={attempt_fps:.3f}, min_frames={attempt_min_frames}, "
+                        f"max_frames={attempt_max_frames}, max_new_tokens={attempt_max_new_tokens}"
+                    )
+
+        raise RuntimeError("Unexpected OOM retry flow termination.")
 
     full_start = float(video_start)
     full_end = float(video_end) if video_end is not None else _get_video_duration_seconds(video_path)
@@ -1481,6 +1887,35 @@ def run_query_extraction(
     )
 
 
+def _resolve_harm_rules_text(
+    *,
+    harm_rules_text: str = "",
+    harm_rules_txt_path: str | None = None,
+) -> str:
+    text = str(harm_rules_text or "").strip()
+    if text:
+        return text
+
+    txt_path = str(harm_rules_txt_path or "").strip()
+    if txt_path:
+        return Path(txt_path).expanduser().read_text(encoding="utf-8").strip()
+
+    from evidence_judge_pipeline import BUILTIN_HARM_RULES
+
+    return str(BUILTIN_HARM_RULES).strip()
+
+
+def _is_same_model_path(a: str, b: str) -> bool:
+    pa = str(a or "").strip()
+    pb = str(b or "").strip()
+    if not pa or not pb:
+        return False
+    try:
+        return Path(pa).expanduser().resolve() == Path(pb).expanduser().resolve()
+    except Exception:
+        return pa == pb
+
+
 def run_global_understanding_and_query_extraction(
     video_path: str,
     user_focus: str = "",
@@ -1503,12 +1938,23 @@ def run_global_understanding_and_query_extraction(
     merge_max_new_tokens: int = 1024,
     merge_max_continuations: int = 3,
     run_localizer: bool = False,
+    run_evidence_judge: bool = False,
+    harm_rules_text: str = "",
+    evidence_judge_vl_model_path: str = DEFAULT_EVIDENCE_JUDGE_VL_MODEL_PATH,
+    evidence_judge_vl_device: str | None = None,
+    evidence_judge_vl_max_new_tokens: int = 768,
+    evidence_judge_max_visual_frames: int = 6,
+    evidence_judge_llm_model_path: str = DEFAULT_EVIDENCE_JUDGE_LLM_MODEL_PATH,
+    evidence_judge_llm_device: str | None = None,
+    evidence_judge_llm_max_new_tokens: int = 1024,
     localizer_config: dict[str, Any] | None = None,
     localizer_whisper_model_path: str = DEFAULT_LOCALIZER_WHISPER_MODEL_PATH,
     localizer_whisper_device: str | None = None,
     model_registry: ModelRegistry | None = None,
 ) -> GlobalPipelineResult:
     """总流程：模块 A 生成报告，再由模块 C 提炼 Query。"""
+
+    effective_run_localizer = bool(run_localizer or run_evidence_judge)
 
     registry = model_registry
     if registry is None:
@@ -1519,7 +1965,7 @@ def run_global_understanding_and_query_extraction(
             load_query=True,
             query_model_path=query_model_path,
             query_device=query_device,
-            load_whisper=run_localizer,
+            load_whisper=effective_run_localizer,
             whisper_model_path=localizer_whisper_model_path,
             whisper_device=localizer_whisper_device,
         )
@@ -1557,7 +2003,7 @@ def run_global_understanding_and_query_extraction(
     )
 
     evidence_results: list[dict[str, Any]] | None = None
-    if run_localizer:
+    if effective_run_localizer:
         localizer_cfg = localizer_config if localizer_config is not None else {}
         evidence_results = run_query_evidence_localizer(
             video_path=video_path,
@@ -1566,10 +2012,43 @@ def run_global_understanding_and_query_extraction(
             whisper_runtime=registry.whisper,
         )
 
+    evidence_judge_result: dict[str, Any] | None = None
+    if run_evidence_judge:
+        resolved_harm_rules_text = _resolve_harm_rules_text(harm_rules_text=harm_rules_text)
+        if evidence_results is None:
+            raise ValueError("run_evidence_judge 依赖 localizer 结果，但 evidence_results 为空。")
+
+        _release_omni_runtime(registry)
+        evidence_judge_vl_runtime = _get_or_load_evidence_judge_vl_runtime(
+            registry=registry,
+            model_path=evidence_judge_vl_model_path,
+            device=evidence_judge_vl_device,
+        )
+        judge_runtime_for_evidence = (
+            registry.query if _is_same_model_path(query_model_path, evidence_judge_llm_model_path) else None
+        )
+        evidence_judge_result = run_query_evidence_judge(
+            video_path=video_path,
+            retrieval_queries=query_result.retrieval_queries,
+            evidence_results=evidence_results,
+            report_text=report_text,
+            harm_rules_text=resolved_harm_rules_text,
+            qwen3_vl_model_path=evidence_judge_vl_model_path,
+            qwen3_vl_device=evidence_judge_vl_device,
+            qwen3_vl_max_new_tokens=evidence_judge_vl_max_new_tokens,
+            max_visual_frames=evidence_judge_max_visual_frames,
+            judge_model_path=evidence_judge_llm_model_path,
+            judge_device=evidence_judge_llm_device,
+            judge_max_new_tokens=evidence_judge_llm_max_new_tokens,
+            vl_runtime=evidence_judge_vl_runtime,
+            judge_runtime=judge_runtime_for_evidence,
+        )
+
     return GlobalPipelineResult(
         report_text=report_text,
         query_result=query_result,
         evidence_results=evidence_results,
+        evidence_judge_result=evidence_judge_result,
     )
 
 
@@ -1592,6 +2071,27 @@ def _resolve_localization_json_save_path(video_path: str, save_localization_json
         video = Path(video_path)
         return video.with_suffix(".localization.json")
     return Path(save_localization_json)
+
+
+def _resolve_evidence_card_json_save_path(video_path: str, save_evidence_card_json: str) -> Path:
+    if save_evidence_card_json == "auto":
+        video = Path(video_path)
+        return video.with_suffix(".evidence_card.json")
+    return Path(save_evidence_card_json)
+
+
+def _resolve_judge_input_txt_save_path(video_path: str, save_judge_input_txt: str) -> Path:
+    if save_judge_input_txt == "auto":
+        video = Path(video_path)
+        return video.with_suffix(".judge_input.txt")
+    return Path(save_judge_input_txt)
+
+
+def _resolve_judge_final_txt_save_path(video_path: str, save_judge_final_txt: str) -> Path:
+    if save_judge_final_txt == "auto":
+        video = Path(video_path)
+        return video.with_suffix(".judge_final.txt")
+    return Path(save_judge_final_txt)
 
 
 def _resolve_localizer_frames_dir(video_path: str, localizer_frames_dir: str | None) -> Path:
@@ -1782,6 +2282,56 @@ def run_query_evidence_localizer(
     )
 
 
+def run_query_evidence_judge(
+    video_path: str,
+    retrieval_queries: list[RetrievalQuery] | list[dict[str, Any]],
+    evidence_results: list[dict[str, Any]],
+    report_text: str,
+    harm_rules_text: str = "",
+    harm_rules_txt_path: str | None = None,
+    *,
+    qwen3_vl_model_path: str = DEFAULT_EVIDENCE_JUDGE_VL_MODEL_PATH,
+    qwen3_vl_device: str | None = None,
+    qwen3_vl_max_new_tokens: int = 768,
+    max_visual_frames: int = 6,
+    judge_model_path: str = DEFAULT_EVIDENCE_JUDGE_LLM_MODEL_PATH,
+    judge_device: str | None = None,
+    judge_max_new_tokens: int = 1024,
+    vl_runtime: Any | None = None,
+    judge_runtime: Any | None = None,
+) -> dict[str, Any]:
+    from evidence_judge_pipeline import run_evidence_judge_pipeline
+
+    normalized_queries: list[dict[str, Any]] = []
+    for q in retrieval_queries:
+        if isinstance(q, RetrievalQuery):
+            normalized_queries.append(_query_to_output_dict(q))
+        elif isinstance(q, dict):
+            normalized_queries.append(q)
+
+    resolved_harm_rules_text = _resolve_harm_rules_text(
+        harm_rules_text=harm_rules_text,
+        harm_rules_txt_path=harm_rules_txt_path,
+    )
+
+    return run_evidence_judge_pipeline(
+        queries_payload={"retrieval_queries": normalized_queries},
+        localization_payload={"evidence_results": evidence_results},
+        global_report=report_text,
+        harm_rules=resolved_harm_rules_text,
+        video_path=video_path,
+        qwen3_vl_model=qwen3_vl_model_path,
+        qwen3_vl_device=qwen3_vl_device,
+        qwen3_vl_max_new_tokens=qwen3_vl_max_new_tokens,
+        max_visual_frames=max_visual_frames,
+        judge_model=judge_model_path,
+        judge_device=judge_device,
+        judge_max_new_tokens=judge_max_new_tokens,
+        vl_runtime=vl_runtime,
+        judge_runtime=judge_runtime,
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Qwen2.5-Omni 模块 A/C 推理脚本")
 
@@ -1838,6 +2388,56 @@ if __name__ == "__main__":
         help="localizer Whisper 运行设备，如 cuda / cuda:0 / cpu",
     )
 
+    parser.add_argument("--run_evidence_judge", action="store_true", help="启用证据卡分析 + 最终审判（Qwen3-VL + Qwen3-4B）")
+    parser.add_argument(
+        "--harm_rules_txt",
+        type=str,
+        default=None,
+        help="有害内容分类规则文本路径；不填则自动使用 evidence_judge_pipeline 内置规则",
+    )
+    parser.add_argument(
+        "--evidence_judge_vl_model",
+        type=str,
+        default=DEFAULT_EVIDENCE_JUDGE_VL_MODEL_PATH,
+        help="evidence_judge 的 Qwen3-VL 模型路径",
+    )
+    parser.add_argument(
+        "--evidence_judge_vl_device",
+        type=str,
+        default=None,
+        help="evidence_judge 的 Qwen3-VL 运行设备，如 cuda:0 / cpu",
+    )
+    parser.add_argument(
+        "--evidence_judge_vl_max_new_tokens",
+        type=int,
+        default=768,
+        help="evidence_judge 每个 query 的 Qwen3-VL 最大生成 token",
+    )
+    parser.add_argument(
+        "--evidence_judge_max_visual_frames",
+        type=int,
+        default=6,
+        help="evidence_judge 的 Visual query 输入帧上限",
+    )
+    parser.add_argument(
+        "--evidence_judge_model",
+        type=str,
+        default=DEFAULT_EVIDENCE_JUDGE_LLM_MODEL_PATH,
+        help="evidence_judge 的最终审判模型路径（Qwen3-4B）",
+    )
+    parser.add_argument(
+        "--evidence_judge_device",
+        type=str,
+        default=None,
+        help="evidence_judge 最终审判模型设备，如 cuda:0 / cpu",
+    )
+    parser.add_argument(
+        "--evidence_judge_max_new_tokens",
+        type=int,
+        default=1024,
+        help="evidence_judge 最终审判模型最大生成 token",
+    )
+
     parser.add_argument("--disable_preload", action="store_true", help="禁用统一模型预加载（默认会在 A+C 模式预加载）")
 
     parser.add_argument(
@@ -1861,8 +2461,31 @@ if __name__ == "__main__":
         default=None,
         help="可选保存 localizer 结果 JSON。仅写 --save_localization_json 时自动保存为同名 .localization.json；也可指定输出路径",
     )
+    parser.add_argument(
+        "--save_evidence_card_json",
+        nargs="?",
+        const="auto",
+        default=None,
+        help="可选保存 evidence_card JSON。仅写 --save_evidence_card_json 时自动保存为同名 .evidence_card.json；也可指定输出路径",
+    )
+    parser.add_argument(
+        "--save_judge_input_txt",
+        nargs="?",
+        const="auto",
+        default=None,
+        help="可选保存审判输入文本。仅写 --save_judge_input_txt 时自动保存为同名 .judge_input.txt；也可指定输出路径",
+    )
+    parser.add_argument(
+        "--save_judge_final_txt",
+        nargs="?",
+        const="auto",
+        default=None,
+        help="可选保存最终审判结果。仅写 --save_judge_final_txt 时自动保存为同名 .judge_final.txt；也可指定输出路径",
+    )
 
     args = parser.parse_args()
+
+    effective_run_localizer = bool(args.run_localizer or args.run_evidence_judge)
 
     model_registry: ModelRegistry | None = None
     if args.run_query_extraction and not args.disable_preload:
@@ -1873,7 +2496,7 @@ if __name__ == "__main__":
             load_query=True,
             query_model_path=args.query_model,
             query_device=args.query_device,
-            load_whisper=args.run_localizer,
+            load_whisper=effective_run_localizer,
             whisper_model_path=args.localizer_whisper_model,
             whisper_device=args.localizer_whisper_device,
         )
@@ -1937,7 +2560,7 @@ if __name__ == "__main__":
             )
             print(f"\nQuery JSON 已保存: {query_save_path}")
 
-        if args.run_localizer:
+        if effective_run_localizer:
             localizer_cfg = _build_localizer_config(
                 blip_model=args.localizer_blip_model,
                 device=args.localizer_device,
@@ -1979,13 +2602,96 @@ if __name__ == "__main__":
                 print(f"导出帧总数: {frame_manifest['exported_frame_count']}")
             except Exception as exc:
                 print(f"\n[提示] 局部证据帧导出失败: {exc}")
+
+            if args.run_evidence_judge:
+                _release_omni_runtime(model_registry)
+                evidence_judge_vl_runtime = _get_or_load_evidence_judge_vl_runtime(
+                    registry=model_registry,
+                    model_path=args.evidence_judge_vl_model,
+                    device=args.evidence_judge_vl_device,
+                )
+                judge_runtime_for_evidence = (
+                    model_registry.query if (model_registry and _is_same_model_path(args.query_model, args.evidence_judge_model)) else None
+                )
+                evidence_judge_result = run_query_evidence_judge(
+                    video_path=args.video,
+                    retrieval_queries=query_result.retrieval_queries,
+                    evidence_results=evidence_results,
+                    report_text=report,
+                    harm_rules_txt_path=args.harm_rules_txt,
+                    qwen3_vl_model_path=args.evidence_judge_vl_model,
+                    qwen3_vl_device=args.evidence_judge_vl_device,
+                    qwen3_vl_max_new_tokens=args.evidence_judge_vl_max_new_tokens,
+                    max_visual_frames=args.evidence_judge_max_visual_frames,
+                    judge_model_path=args.evidence_judge_model,
+                    judge_device=args.evidence_judge_device,
+                    judge_max_new_tokens=args.evidence_judge_max_new_tokens,
+                    vl_runtime=evidence_judge_vl_runtime,
+                    judge_runtime=judge_runtime_for_evidence,
+                )
+
+                print("\n" + "=" * 60)
+                print("最终审判结果（Qwen3-4B）")
+                print("=" * 60)
+                print(str(evidence_judge_result.get("judge_normalized", "")).strip())
+
+                if args.save_evidence_card_json is not None:
+                    evidence_card_save_path = _resolve_evidence_card_json_save_path(args.video, args.save_evidence_card_json)
+                    evidence_card_save_path.parent.mkdir(parents=True, exist_ok=True)
+                    evidence_card_save_path.write_text(
+                        str(evidence_judge_result.get("evidence_card_json", "")),
+                        encoding="utf-8",
+                    )
+                    print(f"\nEvidence Card JSON 已保存: {evidence_card_save_path}")
+
+                if args.save_judge_input_txt is not None:
+                    judge_input_save_path = _resolve_judge_input_txt_save_path(args.video, args.save_judge_input_txt)
+                    judge_input_save_path.parent.mkdir(parents=True, exist_ok=True)
+                    judge_input_save_path.write_text(
+                        str(evidence_judge_result.get("judge_prompt", "")),
+                        encoding="utf-8",
+                    )
+                    print(f"审判输入文本已保存: {judge_input_save_path}")
+
+                if args.save_judge_final_txt is not None:
+                    judge_final_save_path = _resolve_judge_final_txt_save_path(args.video, args.save_judge_final_txt)
+                    judge_final_save_path.parent.mkdir(parents=True, exist_ok=True)
+                    judge_final_save_path.write_text(
+                        "\n".join(
+                            [
+                                "[raw_output]",
+                                str(evidence_judge_result.get("judge_raw", "")),
+                                "",
+                                "[normalized_output]",
+                                str(evidence_judge_result.get("judge_normalized", "")),
+                            ]
+                        ),
+                        encoding="utf-8",
+                    )
+                    print(f"审判结果已保存: {judge_final_save_path}")
         elif args.save_localization_json is not None:
-            print("\n[提示] 已指定 --save_localization_json，但未启用 --run_localizer，跳过保存。")
+            print("\n[提示] 已指定 --save_localization_json，但未启用 --run_localizer/--run_evidence_judge，跳过保存。")
+
+        if not args.run_evidence_judge:
+            if args.save_evidence_card_json is not None:
+                print("\n[提示] 已指定 --save_evidence_card_json，但未启用 --run_evidence_judge，跳过保存。")
+            if args.save_judge_input_txt is not None:
+                print("\n[提示] 已指定 --save_judge_input_txt，但未启用 --run_evidence_judge，跳过保存。")
+            if args.save_judge_final_txt is not None:
+                print("\n[提示] 已指定 --save_judge_final_txt，但未启用 --run_evidence_judge，跳过保存。")
 
     else:
         if args.save_query_json is not None:
             print("\n[提示] 已指定 --save_query_json，但未启用 --run_query_extraction，跳过保存。")
         if args.run_localizer:
             print("\n[提示] 已启用 --run_localizer，但未启用 --run_query_extraction，localizer 不会执行。")
+        if args.run_evidence_judge:
+            print("\n[提示] 已启用 --run_evidence_judge，但未启用 --run_query_extraction，evidence_judge 不会执行。")
         if args.save_localization_json is not None:
             print("\n[提示] 已指定 --save_localization_json，但未启用 --run_query_extraction，跳过保存。")
+        if args.save_evidence_card_json is not None:
+            print("\n[提示] 已指定 --save_evidence_card_json，但未启用 --run_query_extraction，跳过保存。")
+        if args.save_judge_input_txt is not None:
+            print("\n[提示] 已指定 --save_judge_input_txt，但未启用 --run_query_extraction，跳过保存。")
+        if args.save_judge_final_txt is not None:
+            print("\n[提示] 已指定 --save_judge_final_txt，但未启用 --run_query_extraction，跳过保存。")

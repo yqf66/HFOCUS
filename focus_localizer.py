@@ -16,6 +16,7 @@ Public APIs:
 from __future__ import annotations
 
 import math
+import os
 import re
 import subprocess
 import tempfile
@@ -71,6 +72,21 @@ def _merge_config(config: dict[str, Any] | None) -> dict[str, Any]:
     return merged
 
 
+def _resolve_temp_dir() -> str:
+    for key in ("TMPDIR", "TEMP", "TMP"):
+        candidate = str(os.environ.get(key, "")).strip()
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path)
+
+    # Default to repo-local temporary directory to avoid /tmp space pressure.
+    default_dir = Path(__file__).resolve().parent / ".tmp"
+    default_dir.mkdir(parents=True, exist_ok=True)
+    return str(default_dir)
+
+
 def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
@@ -81,31 +97,6 @@ def _segment_iou(a_start: float, a_end: float, b_start: float, b_end: float) -> 
     if union <= 1e-8:
         return 0.0
     return inter / union
-
-
-def _parse_time_hint_anchor(time_hint: str, duration_sec: float) -> float | None:
-    if not time_hint:
-        return None
-    hint = time_hint.lower().split("|", 1)[0].strip()
-    phase_to_ratio = {
-        "beginning": 0.1,
-        "early-middle": 0.3,
-        "middle": 0.5,
-        "late-middle": 0.7,
-        "ending": 0.9,
-    }
-    if hint not in phase_to_ratio:
-        return None
-    return phase_to_ratio[hint] * max(0.0, duration_sec)
-
-
-def _time_hint_prior(center_sec: float, duration_sec: float, time_hint: str) -> float:
-    anchor = _parse_time_hint_anchor(time_hint=time_hint, duration_sec=duration_sec)
-    if anchor is None or duration_sec <= 1e-8:
-        return 0.5
-    sigma = max(0.5, 0.2 * duration_sec)
-    dist = abs(center_sec - anchor)
-    return float(math.exp(-(dist * dist) / (2.0 * sigma * sigma)))
 
 
 def _enforce_segment_length(
@@ -213,7 +204,6 @@ def _build_candidates(
     coarse_points: list[dict[str, Any]],
     cfg: dict[str, Any],
     duration_sec: float,
-    time_hint: str,
 ) -> list[dict[str, Any]]:
     if not coarse_points:
         return []
@@ -258,14 +248,12 @@ def _build_candidates(
         expected_points = max(1.0, seg_len * float(cfg["coarse_sample_fps"]))
         point_count = sum(1 for p in coarse_points if start <= p["time_sec"] <= end)
         continuity = _clamp(point_count / expected_points, 0.0, 1.0)
-        hint_prior = _time_hint_prior(center_sec=(start + end) / 2.0, duration_sec=duration_sec, time_hint=time_hint)
 
         segment_score = (
-            0.45 * mean_score
+            0.50 * mean_score
             + 0.30 * peak_score
             + 0.15 * compactness
             + 0.05 * continuity
-            + 0.05 * hint_prior
         )
         segment_score = float(_clamp(segment_score, 0.0, 1.0))
 
@@ -329,6 +317,57 @@ def _select_supporting_frames(
     ]
 
 
+def _pick_top_supporting_frame(supporting_frames: list[dict[str, Any]] | Any) -> dict[str, Any] | None:
+    if not isinstance(supporting_frames, list):
+        return None
+    valid: list[dict[str, Any]] = []
+    for item in supporting_frames:
+        if not isinstance(item, dict):
+            continue
+        try:
+            frame_idx = int(item.get("frame_idx"))
+            time_sec = float(item.get("time_sec"))
+            score = float(item.get("score", 0.0))
+        except Exception:
+            continue
+        valid.append(
+            {
+                "frame_idx": frame_idx,
+                "time_sec": time_sec,
+                "score": score,
+            }
+        )
+    if not valid:
+        return None
+    return max(valid, key=lambda x: (float(x.get("score", 0.0)), -int(x.get("frame_idx", 0))))
+
+
+def _build_visual_analysis_evidence(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "query_type": "Visual",
+        "evidence_found": bool(result.get("evidence_found")),
+        "main_segment": result.get("main_segment"),
+        "supporting_frames": result.get("supporting_frames"),
+    }
+
+
+def _build_asr_analysis_evidence(result: dict[str, Any]) -> dict[str, Any]:
+    asr_result = result.get("asr_result")
+    asr_dict = asr_result if isinstance(asr_result, dict) else {}
+    top_frame = _pick_top_supporting_frame(result.get("supporting_frames"))
+    return {
+        "query_type": "ASR",
+        "evidence_found": bool(result.get("evidence_found")),
+        "main_segment": result.get("main_segment"),
+        "top_supporting_frame": top_frame,
+        "asr_text": str(asr_dict.get("text", "") or "").strip(),
+        "emotion": asr_dict.get("emotion") if isinstance(asr_dict.get("emotion"), dict) else {},
+        "sound_events": asr_dict.get("sound_events") if isinstance(asr_dict.get("sound_events"), list) else [],
+        "asr_status": str(result.get("asr_status", "") or "").strip(),
+        "asr_reason": str(result.get("asr_reason", "") or "").strip(),
+    }
+
+
 def _sample_indices(start_idx: int, end_idx: int, step: int, anchors: list[int] | None = None) -> list[int]:
     if end_idx < start_idx:
         return []
@@ -350,7 +389,12 @@ def _extract_audio_segment_to_wav(
     end = float(max(start + 1e-3, end_sec))
     duration = float(max(1e-3, end - start))
 
-    with tempfile.NamedTemporaryFile(prefix="focus_asr_clip_", suffix=".wav", delete=False) as tmp:
+    with tempfile.NamedTemporaryFile(
+        prefix="focus_asr_clip_",
+        suffix=".wav",
+        dir=_resolve_temp_dir(),
+        delete=False,
+    ) as tmp:
         wav_path = Path(tmp.name)
 
     cmd = [
@@ -1019,7 +1063,6 @@ def _empty_result(query: dict[str, Any]) -> dict[str, Any]:
         "query_id": str(query.get("id", "")),
         "query_text": str(query.get("query_text", "")),
         "query_type": str(query.get("query_type", "")),
-        "time_hint": str(query.get("time_hint", "")),
         "evidence_found": False,
         "main_segment": None,
         "supporting_frames": [],
@@ -1097,7 +1140,6 @@ def _localize_visual_query(
         coarse_points=coarse_points,
         cfg=cfg,
         duration_sec=duration_sec,
-        time_hint=str(query_dict.get("time_hint", "")),
     )
     if not candidates:
         return result
@@ -1158,6 +1200,7 @@ def _localize_asr_query(
     if not bool(visual_result.get("evidence_found")):
         if not str(visual_result.get("skip_reason", "")).strip():
             visual_result["skip_reason"] = "Visual localization failed for ASR route."
+        visual_result["evidence_for_analysis"] = _build_asr_analysis_evidence(visual_result)
         return visual_result
 
     fps = float(video.get_avg_fps())
@@ -1177,6 +1220,7 @@ def _localize_asr_query(
     audio_clip_path = str(asr_payload.get("audio_clip_path", "")).strip()
     if audio_clip_path:
         visual_result["asr_audio_clip_path"] = audio_clip_path
+    visual_result["evidence_for_analysis"] = _build_asr_analysis_evidence(visual_result)
     return visual_result
 
 
@@ -1200,12 +1244,14 @@ def _localize_single_query(
         return result
 
     if query_type == "Visual":
-        return _localize_visual_query(
+        result = _localize_visual_query(
             video=video,
             query_dict=query_dict,
             cfg=cfg,
             similarity_fn=similarity_fn,
         )
+        result["evidence_for_analysis"] = _build_visual_analysis_evidence(result)
+        return result
 
     if query_type == "ASR":
         return _localize_asr_query(
