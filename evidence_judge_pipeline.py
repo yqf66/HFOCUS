@@ -15,9 +15,9 @@ DEFAULT_QWEN3_VL_MODEL_PATH = "/sda/yuqifan/HFOCUS/Qwen3-VL"
 DEFAULT_QWEN3_4B_MODEL_PATH = "/sda/yuqifan/HFOCUS/Qwen3-4B"
 
 BUILTIN_HARM_RULES = """
-I. Maliciously Inciting Division and Intensifying Social Conflict
+I. Maliciously Inciting Division, Discrimination, and Social Conflict
 
-The core task is to identify any content that intends to create hatred, confrontation, or discrimination between groups.
+The core task is to identify content that creates hatred, group confrontation, discrimination, humiliation, or harmful stereotypes.
 
 The definition and judgment criteria for Category 1 harmful content are as follows and must be followed strictly:
 
@@ -27,7 +27,7 @@ This includes provoking hostility, suspicion, or antagonism between groups defin
 -2. Creating national or political confrontation: must be judged as harmful.
 This includes provoking hostility between different countries, such as China vs. the United States or Russia vs. Ukraine, or intensifying political factional struggle within a country.
 
--3. Discriminating against or humiliating specific groups: must be judged as harmful.
+-3. Discriminating against, humiliating, or stereotyping specific groups: must be judged as harmful.
 This includes mockery, ridicule, humiliation, or the reinforcement of stereotypes based on the group attributes described above. The key distinction from confrontation is that discrimination is centered on contempt and degradation rather than direct opposition.
 
 Important principle:
@@ -120,19 +120,30 @@ Rules you must follow:
    - Instead, answer the verification intent expressed by why_this_query.
    - In other words, you must answer whether the current evidence can clarify the issue that why_this_query is trying to verify.
 
-3. Strictly separate observation from inference:
-   - Only information directly supported by images, ASR transcripts, emotion analysis, sound event detection, main segments, or supporting frames counts as observed evidence.
-   - Motives, stances, identities, deeper meanings, and value judgments may only be inferred cautiously when the evidence allows.
-   - Do not present guesses as facts.
+3. Separate direct evidence from reasonable inference:
+   - Clearly distinguish direct evidence from inference.
+   - Direct evidence includes information directly supported by images, ASR transcripts, emotion analysis, sound event detection, main segments, or supporting frames.
+   - Reasonable inference is allowed when it is grounded in sufficient direct evidence, but it must be phrased cautiously.
+   - When making an inference, briefly indicate the supporting evidence it is based on.
+   - Do not present subjective interpretation, motive, stance, identity, deeper meaning, or value judgment as a directly observed fact.
+   
+4. Mandatory attention to on-screen text and detailed person description:
+   - Actively inspect evidence frames for visible on-screen text, including subtitles, captions, UI text, memes, signs, banners, labels, logos, and printed text on clothing/objects.
+   - Do NOT treat on-screen text as spoken audio unless it is also clearly heard or appears in the ASR transcript.
 
-4. Handling different query types:
+   - For every main visible person or character, evidence_observation MUST include a compact person description.
+   - Each main person description MUST explicitly include:
+     gender presentation, clothing / accessories, race / ethnicity(e.g., “Black”, “White”, “Asian”, “Brown”, “Latino”, “Middle Eastern”), distinctive symbols or decorations, action, and interaction with others.
+   - If clear religious or cultural markers are visible, such as hijab, niqab, kufi, turban, cross necklace, religious clothing, or religious text, describe the visible marker directly; otherwise omit religion.
+
+5. Handling different query types:
    - If query_type = Visual:
      Focus on the extracted supporting frames, main segment, and visual cues, and explain what the current visual evidence supports with respect to why_this_query.
    - If query_type = ASR:
      Focus on the highest-relevance visual anchor frame, the ASR transcript for the corresponding segment, emotion analysis, and sound event detection, and explain what the current audio-related evidence supports with respect to why_this_query.
    - Do not treat ASR emotion labels as definitive semantic meaning, and do not use a single visual frame to over-complete the meaning of spoken content.
 
-5. The output should serve the downstream final judge:
+6. The output should serve the downstream final judge:
    - answer_to_why must directly answer the question that why_this_query is trying to verify.
    - support_level indicates how strongly the current evidence supports that answer; it is not a judgment about the whole video.
    - remaining_uncertainty should include only the most important unresolved gaps that still matter for the final judgment.
@@ -143,6 +154,7 @@ Output format (must be valid JSON):
   "query_id": "...",
   "query_type": "...",
   "verification_focus": "...",
+  "evidence_observation": "...",
   "evidence_summary": "...",
   "answer_to_why": "...",
   "support_level": "strongly_supported | supported | weakly_supported | inconclusive | contradicted",
@@ -160,12 +172,41 @@ support_level rules:
 Field requirements:
 - verification_focus:
   State in one sentence the core question that why_this_query is actually trying to verify. Do not copy it too literally if it is overly long.
+
+- evidence_observation:
+  Describe the current local evidence itself, independent of query_text and why_this_query.
+  Use the following compact semi-structured format:
+  
+  [Evidence Observation]
+  - scene: describe the visible setting or environment.
+  - main subjects:
+    - Subject A:
+      - gender presentation: ...
+      - clothing / accessories: ...
+      - race / ethnicity: Black / White / Asian / Brown / Latino / Middle Eastern / uncertain
+      - action / interaction: ...
+      - religious / cultural markers: ... [only include this line if clearly visible]
+    - Subject B:
+      - gender presentation: ...
+      - clothing / accessories: ...
+      - race / ethnicity: Black / White / Asian / Brown / Latino / Middle Eastern / uncertain
+      - action / interaction: ...
+      - religious / cultural markers: ... [only include this line if clearly visible]
+  - on-screen text: quote important visible text, including subtitles, captions, UI text, signs, labels, memes, banners, logos, or printed text. If none is visible, write "no visible on-screen text".
+  - audio / speech: summarize relevant ASR, sound events, or emotion cues if available; do not treat on-screen text as speech unless it is also heard.
+  - overall description: provide one concise natural-language paragraph describing what this local evidence appears to show, separating direct observation from cautious inference.
+
+  Keep this section observation-first and avoid final judgment. Reasonable inference is allowed only when grounded in the evidence.
+  
 - evidence_summary:
   Briefly summarize only the parts of the current local evidence that are truly relevant to this verification target. Do not broadly restate all input content.
+
 - answer_to_why:
   Directly answer the question that why_this_query is trying to clarify. If the current evidence only answers part of it, explicitly state what can and cannot currently be confirmed.
+
 - remaining_uncertainty:
   Include only the most important unresolved issue(s), prioritizing those that still matter for the downstream final judge.
+
 - confidence:
   Reflect your confidence in this evidence card, considering evidence quality, directness, consistency, and ambiguity.
 
@@ -183,60 +224,65 @@ Field requirements:
 """
 
 JUDGE_SYSTEM_PROMPT = (
-    "You are a final harmful-content adjudication model. "
+    "You are a harmful-content category adjudication model. "
     "You will receive multiple evidence cards, an Omni global understanding report, "
-    "and harmful-content classification rules. "
-    "Your task is to make the final judgment based on the rules, not to improvise freely. "
+    "and one target harmful-content category rule. "
+    "Your task is to decide whether this single target category applies to the video. "
     "You must treat the verified local evidence as the core basis of judgment, "
     "and use inferential content from the global report cautiously. "
-    "When evidence is insufficient, conflicting, or not enough to map cleanly to the rules, "
-    "you must state that clearly in your reasoning and must not present guesses as facts."
+    "If evidence is insufficient, weak, conflicting, or mainly points to other categories, "
+    "you must mark the target category as not applicable rather than guessing."
 )
 
-JUDGE_USER_PROMPT_TEMPLATE = """Please perform the final adjudication.
+JUDGE_CATEGORY_USER_PROMPT_TEMPLATE = """Please judge whether the following single harmful-content category applies to the video.
 
 Task goal:
-Based on the provided evidence cards, the global understanding report, and the harmful-content classification rules,
-determine whether the final label for this video should be <Harmful> or <Harmless>.
+Based on the provided evidence cards, the global understanding report, and the target harmful-content category rule,
+determine whether this specific category should be judged as <适用> or <不适用>.
 
-Adjudication principles (must follow):
-1. Rules first:
-   - The final judgment must align as closely as possible with [Harmful Content Classification Rules].
-   - Do not make the final decision based only on vague impressions, tone, commonsense associations, or isolated clues.
+Judging principles (must follow):
+1. Judge only the target category:
+   - Focus only on [Target Harm Category Rule].
+   - Do not mark this category as applicable just because some other harmful category might apply.
 
 2. Verified evidence comes first:
-   - [Evidence Cards] are the core basis for the final judgment.
-   - Each evidence card reflects how well one why_this_query has been answered under the current evidence.
-   - Prioritize verification_focus, answer_to_why, support_level, remaining_uncertainty, and confidence when forming the final judgment.
+   - [Evidence Cards] are the core basis for this category judgment.
+   - Prioritize verification_focus, answer_to_why, support_level, remaining_uncertainty, and confidence.
+   - If the key evidence cards for this category are mostly inconclusive, weakly_supported, contradicted, or low-confidence, output <不适用>.
 
 3. Use the global report cautiously:
-   - [Omni Global Understanding Report] is only supplementary context and must not override or replace local verification results.
-   - If a claim in the global report is not actually supported by the evidence cards, it should not be used as a core basis for final labeling.
+   - [Omni Global Understanding Report] is supplementary context only.
+   - It may help interpretation, but it must not override or replace the evidence cards.
+   - If the global report is unsupported by the evidence cards, do not use it as the main basis.
 
-4. Handle conflict and insufficiency carefully:
-   - If different evidence cards conflict with each other, you must point this out and explain which evidence you trust more and why.
-   - If most key evidence cards remain inconclusive, weakly_supported, or low-confidence, do not force a strong conclusion.
-   - Only output <Harmful> when the core harmful criteria are sufficiently supported.
+4. Threshold for <适用>:
+   - Output <适用> only when the current evidence sufficiently supports that the video matches the harmful criteria in the target category rule.
+   - Do not rely on vague impressions, associative leaps, or peripheral clues.
 
-5. Focus on core criteria, not simple counting:
-   - More evidence cards do not automatically mean stronger justification.
-   - What matters is whether they jointly support a key harmful-content rule.
-   - If the supported evidence concerns only peripheral details, while the core harmful intent, behavior, expression, or value orientation remains unverified, stay cautious.
+5. Threshold for <不适用>:
+   - Output <不适用> if the evidence is insufficient, mainly supports a different category, or does not map cleanly to the target category rule.
+   - You may still mention uncertainty, but the binary output must remain either <适用> or <不适用>.
 
-6. Report uncertainty only when it is decision-relevant:
-   - If there are still important unresolved uncertainties or evidence gaps that could materially affect the final judgment, explicitly mention them.
-   - If the evidence is already clear, sufficient, and consistent enough for a confident judgment, you do not need to force additional uncertainty statements.
+6. Output requirements:
+   - Output strictly valid JSON only
+   - applicability must be exactly "<适用>" or "<不适用>"
+   - reasoning must explain why this target category applies or does not apply
+   - key_evidence should summarize the most relevant evidence cards or observations
+   - remaining_uncertainty should mention only decision-relevant unresolved issues
 
-7. Output requirements:
-   - The first line must be exactly <Harmful> or <Harmless>
-   - Then provide one concise but complete reasoning paragraph
-   - The reasoning should include:
-     a) which key evidence supports your conclusion
-     b) which rule(s) that evidence maps to
-     c) any important remaining uncertainty or evidence gaps, but only if they are genuinely decision-relevant
-   - Do not output JSON
-   - Do not use bullet points or extra section headers
-   - Do not restate all evidence cards; summarize only the most important parts
+Output format:
+{{
+  "category_id": "...",
+  "category_name": "...",
+  "applicability": "<适用> | <不适用>",
+  "reasoning": "...",
+  "key_evidence": "...",
+  "remaining_uncertainty": "..."
+}}
+
+[Target Category Metadata]
+- category_id: {category_id}
+- category_name: {category_name}
 
 [Evidence Cards]
 {evidence_cards_json}
@@ -244,11 +290,12 @@ Adjudication principles (must follow):
 [Omni Global Understanding Report]
 {global_report}
 
-[Harmful Content Classification Rules]
-{harm_rules}
+[Target Harm Category Rule]
+{category_rule}
 """
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+_ROMAN_CATEGORY_HEADER_RE = re.compile(r"(?m)^(?P<title>(?:[IVX]+)\.\s.+)$")
 VALID_SUPPORT_LEVELS = {
     "strongly_supported",
     "supported",
@@ -257,6 +304,18 @@ VALID_SUPPORT_LEVELS = {
     "contradicted",
 }
 VALID_CONFIDENCE = {"low", "medium", "high"}
+VALID_CATEGORY_APPLICABILITY = {"<适用>", "<不适用>"}
+REQUIRED_VL_CARD_FIELDS = (
+    "query_id",
+    "query_type",
+    "verification_focus",
+    "evidence_observation",
+    "evidence_summary",
+    "answer_to_why",
+    "support_level",
+    "remaining_uncertainty",
+    "confidence",
+)
 
 
 @dataclass
@@ -304,6 +363,38 @@ def _resolve_harm_rules(harm_rules_txt_path: str, use_builtin_harm_rules: bool) 
     return BUILTIN_HARM_RULES.strip()
 
 
+def _split_harm_rules_into_categories(harm_rules: str) -> list[dict[str, str]]:
+    text = str(harm_rules or "").strip()
+    if not text:
+        return []
+
+    matches = list(_ROMAN_CATEGORY_HEADER_RE.finditer(text))
+    if not matches:
+        return [
+            {
+                "category_id": "CAT1",
+                "category_name": "Harmful Content Rules",
+                "category_rule": text,
+            }
+        ]
+
+    categories: list[dict[str, str]] = []
+    for idx, match in enumerate(matches):
+        start = match.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        block = text[start:end].strip()
+        title = str(match.group("title") or "").strip()
+        category_id = title.split(".", 1)[0].strip() or f"CAT{idx + 1}"
+        categories.append(
+            {
+                "category_id": category_id,
+                "category_name": title,
+                "category_rule": block,
+            }
+        )
+    return categories
+
+
 def _extract_last_json_object(text: str) -> dict[str, Any]:
     decoder = json.JSONDecoder()
     last_obj: dict[str, Any] | None = None
@@ -323,6 +414,19 @@ def _extract_last_json_object(text: str) -> dict[str, Any]:
 
 def _strip_think_blocks(text: str) -> str:
     return _THINK_BLOCK_RE.sub("", text or "").strip()
+
+
+def _normalize_category_applicability(value: Any, raw_text: str = "") -> str:
+    text = str(value or "").strip()
+    if text in VALID_CATEGORY_APPLICABILITY:
+        return text
+
+    combined = f"{text}\n{raw_text}".strip().lower()
+    if ("<不适用>" in combined) or ("不适用" in combined) or ("not applicable" in combined) or ("does not apply" in combined):
+        return "<不适用>"
+    if ("<适用>" in combined) or ("适用" in combined) or ("applicable" in combined) or ("applies" in combined):
+        return "<适用>"
+    return "<不适用>"
 
 
 def _normalize_queries(payload: Any) -> list[dict[str, Any]]:
@@ -373,8 +477,18 @@ def _normalize_vl_analysis_card(parsed: dict[str, Any], query: dict[str, Any]) -
     query_id = str(query.get("id", "")).strip()
     query_type = _normalize_card_query_type(query.get("query_type"), fallback="Visual")
 
+    def _to_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, (list, dict)):
+            # Keep non-string model outputs JSON-readable instead of Python repr.
+            return json.dumps(value, ensure_ascii=False)
+        return str(value).strip()
+
     def _s(key: str) -> str:
-        return str(parsed.get(key, "") or "").strip()
+        return _to_text(parsed.get(key, ""))
 
     parsed_qid = _s("query_id")
     parsed_qtype = _normalize_card_query_type(_s("query_type"), fallback=query_type)
@@ -391,12 +505,21 @@ def _normalize_vl_analysis_card(parsed: dict[str, Any], query: dict[str, Any]) -
         "query_id": parsed_qid or query_id,
         "query_type": parsed_qtype or query_type,
         "verification_focus": _s("verification_focus"),
+        "evidence_observation": _s("evidence_observation"),
         "evidence_summary": _s("evidence_summary"),
         "answer_to_why": _s("answer_to_why"),
         "support_level": support_level,
         "remaining_uncertainty": _s("remaining_uncertainty"),
         "confidence": confidence,
     }
+
+
+def _find_missing_vl_card_fields(card: dict[str, Any]) -> list[str]:
+    missing: list[str] = []
+    for key in REQUIRED_VL_CARD_FIELDS:
+        if not str(card.get(key, "") or "").strip():
+            missing.append(key)
+    return missing
 
 
 def _build_compact_evidence_cards_for_judge(evidence_cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -415,6 +538,7 @@ def _build_compact_evidence_cards_for_judge(evidence_cards: list[dict[str, Any]]
                 "query_text": str(card.get("query_text", "")).strip(),
                 "why_this_query": str(card.get("why_this_query", "")).strip(),
                 "verification_focus": normalized.get("verification_focus", ""),
+                "evidence_observation": normalized.get("evidence_observation", ""),
                 "evidence_summary": normalized.get("evidence_summary", ""),
                 "answer_to_why": normalized.get("answer_to_why", ""),
                 "support_level": normalized.get("support_level", "inconclusive"),
@@ -424,6 +548,96 @@ def _build_compact_evidence_cards_for_judge(evidence_cards: list[dict[str, Any]]
             }
         )
     return compact
+
+
+def _normalize_category_judgement(
+    parsed: dict[str, Any],
+    *,
+    category: dict[str, str],
+    raw_text: str = "",
+    parse_error: str | None = None,
+) -> dict[str, Any]:
+    def _s(key: str) -> str:
+        return str(parsed.get(key, "") or "").strip()
+
+    reasoning = _s("reasoning")
+    key_evidence = _s("key_evidence")
+    remaining_uncertainty = _s("remaining_uncertainty")
+    applicability = _normalize_category_applicability(_s("applicability"), raw_text=raw_text)
+
+    if not reasoning:
+        if parse_error:
+            reasoning = f"模型输出解析失败，按兜底规则归一为 {applicability}。parse_error={str(parse_error).strip()}"
+        elif raw_text.strip():
+            reasoning = raw_text.strip()
+        else:
+            reasoning = f"模型未提供可解析理由，按兜底规则归一为 {applicability}。"
+
+    return {
+        "category_id": str(category.get("category_id", "")).strip(),
+        "category_name": str(category.get("category_name", "")).strip(),
+        "category_rule": str(category.get("category_rule", "")).strip(),
+        "applicability": applicability,
+        "reasoning": reasoning,
+        "key_evidence": key_evidence,
+        "remaining_uncertainty": remaining_uncertainty,
+        "raw_text": raw_text,
+        "parse_error": str(parse_error or "").strip(),
+    }
+
+
+def _compose_category_prompt(
+    *,
+    category: dict[str, str],
+    evidence_cards_json: str,
+    global_report: str,
+) -> str:
+    return JUDGE_CATEGORY_USER_PROMPT_TEMPLATE.format(
+        category_id=str(category.get("category_id", "")).strip(),
+        category_name=str(category.get("category_name", "")).strip(),
+        evidence_cards_json=evidence_cards_json,
+        global_report=global_report.strip(),
+        category_rule=str(category.get("category_rule", "")).strip(),
+    )
+
+
+def _compose_final_category_report(category_results: list[dict[str, Any]]) -> str:
+    applicable = [x for x in category_results if str(x.get("applicability", "")).strip() == "<适用>"]
+    final_label = "<Harmful>" if applicable else "<Harmless>"
+
+    lines = [final_label]
+    for item in category_results:
+        name = str(item.get("category_name", "")).strip() or str(item.get("category_id", "")).strip() or "Unknown Category"
+        applicability = str(item.get("applicability", "")).strip() or "<不适用>"
+        reasoning = str(item.get("reasoning", "")).strip() or "未提供理由。"
+        key_evidence = str(item.get("key_evidence", "")).strip()
+        remaining_uncertainty = str(item.get("remaining_uncertainty", "")).strip()
+
+        line = f"{name}: {applicability}。理由：{reasoning}"
+        if key_evidence:
+            line += f" 关键证据：{key_evidence}"
+        if remaining_uncertainty:
+            line += f" 证据缺口：{remaining_uncertainty}"
+        lines.append(line)
+
+    if applicable:
+        names = "、".join(
+            str(item.get("category_name", "")).strip() or str(item.get("category_id", "")).strip() or "Unknown Category"
+            for item in applicable
+        )
+        lines.append(f"汇总：{names} 判为<适用>，因此最终结果为 <Harmful>。")
+    else:
+        lines.append("汇总：所有有害大类均判为<不适用>，因此最终结果为 <Harmless>。")
+    return "\n".join(lines)
+
+
+def _compose_combined_category_payload(category_results: list[dict[str, Any]], key: str) -> str:
+    blocks: list[str] = []
+    for item in category_results:
+        name = str(item.get("category_name", "")).strip() or str(item.get("category_id", "")).strip() or "Unknown Category"
+        content = str(item.get(key, "") or "").strip()
+        blocks.append(f"[{name}]\n{content}")
+    return "\n\n".join(blocks).strip()
 
 
 def _to_uint8_image(frame: Any) -> Any:
@@ -804,6 +1018,13 @@ def _run_vl_per_query(
     try:
         parsed = _extract_last_json_object(raw)
         normalized = _normalize_vl_analysis_card(parsed=parsed, query=query)
+        missing_fields = _find_missing_vl_card_fields(normalized)
+        if missing_fields:
+            return (
+                raw,
+                normalized,
+                "Missing/empty required evidence card fields: " + ", ".join(missing_fields),
+            )
         return raw, normalized, None
     except Exception as exc:
         return raw, None, str(exc)
@@ -882,6 +1103,8 @@ def _print_evidence_query_result(
     print(f"[Q{rank}/{total}] result query_id={qid} type={query_type}")
     if isinstance(parsed_json, dict):
         print(json.dumps(parsed_json, ensure_ascii=False, indent=2))
+        if str(parse_error or "").strip():
+            print(f"[Q{rank}/{total}] warning={str(parse_error).strip()}")
         return
 
     print(f"[Q{rank}/{total}] parse_error={str(parse_error or '').strip()}")
@@ -981,11 +1204,6 @@ def run_evidence_judge_pipeline(
                 }
             )
 
-        evidence_cards_full_json = json.dumps(
-            {"evidence_cards": evidence_cards},
-            ensure_ascii=False,
-            indent=2,
-        )
         compact_cards = _build_compact_evidence_cards_for_judge(evidence_cards)
         evidence_card_compact_json = json.dumps(
             {"evidence_cards": compact_cards},
@@ -993,23 +1211,72 @@ def run_evidence_judge_pipeline(
             indent=2,
         )
 
-        judge_prompt = JUDGE_USER_PROMPT_TEMPLATE.format(
-            evidence_cards_json=evidence_card_compact_json,
-            global_report=global_report.strip(),
-            harm_rules=harm_rules.strip(),
-        )
-
         effective_judge_runtime = _coerce_external_judge_runtime(judge_runtime)
         if effective_judge_runtime is None:
             effective_judge_runtime = _load_judge_runtime(judge_model, judge_device)
         else:
             print("[提示] 使用外部传入的最终审判 runtime。")
-        judge_raw = _run_final_judge(
-            effective_judge_runtime,
-            judge_prompt=judge_prompt,
-            max_new_tokens=max(128, int(judge_max_new_tokens)),
+        harm_categories = _split_harm_rules_into_categories(harm_rules)
+        if not harm_categories:
+            raise ValueError("harm_rules 未能拆分出任何有害大类。")
+
+        category_results: list[dict[str, Any]] = []
+        for idx, category in enumerate(harm_categories, start=1):
+            category_prompt = _compose_category_prompt(
+                category=category,
+                evidence_cards_json=evidence_card_compact_json,
+                global_report=global_report,
+            )
+            print(
+                f"[Judge {idx}/{len(harm_categories)}] "
+                f"adjudicating category={str(category.get('category_name', '')).strip() or str(category.get('category_id', '')).strip()}"
+            )
+            category_raw = _run_final_judge(
+                effective_judge_runtime,
+                judge_prompt=category_prompt,
+                max_new_tokens=max(128, int(judge_max_new_tokens)),
+            )
+            try:
+                parsed = _extract_last_json_object(category_raw)
+                normalized = _normalize_category_judgement(
+                    parsed,
+                    category=category,
+                    raw_text=category_raw,
+                )
+            except Exception as exc:
+                normalized = _normalize_category_judgement(
+                    {},
+                    category=category,
+                    raw_text=category_raw,
+                    parse_error=str(exc),
+                )
+            print(json.dumps({k: v for k, v in normalized.items() if k not in {"category_rule", "raw_text"}}, ensure_ascii=False, indent=2))
+
+            category_results.append(
+                {
+                    **normalized,
+                    "judge_prompt": category_prompt,
+                }
+            )
+
+        judge_prompt = _compose_combined_category_payload(category_results, "judge_prompt")
+        judge_raw = _compose_combined_category_payload(category_results, "raw_text")
+        judge_normalized = _compose_final_category_report(category_results)
+        category_judgements_json = json.dumps(
+            {"category_judgements": category_results},
+            ensure_ascii=False,
+            indent=2,
         )
-        judge_normalized = _normalize_final_judgement(judge_raw)
+        evidence_cards_full_json = json.dumps(
+            {
+                "evidence_cards": evidence_cards,
+                "evidence_cards_compact": compact_cards,
+                "category_judgements": category_results,
+                "judge_normalized": judge_normalized,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
         return {
             "evidence_cards_full": evidence_cards,
@@ -1019,6 +1286,8 @@ def run_evidence_judge_pipeline(
             # Backward-compatible key: evidence_card_json now stores full cards.
             "evidence_card_json": evidence_cards_full_json,
             "evidence_card_compact_json": evidence_card_compact_json,
+            "category_judgements": category_results,
+            "category_judgements_json": category_judgements_json,
             "judge_prompt": judge_prompt,
             "judge_raw": judge_raw,
             "judge_normalized": judge_normalized,

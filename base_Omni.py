@@ -74,6 +74,7 @@ Key Requirements:
 3. Assign each key visual event an Event ID: E1, E2, E3...
    - Use a small number of salient events rather than many trivial ones.
    - Prefer events that matter for later verification, ambiguity resolution, or final judgment.
+   - When an observed visual event involves important people, symbols, or persistent text, include those visible details inside the corresponding event.
 
 4. Do not overcommit to a single interpretation when important context is missing.
    - If the same observed event could support multiple meaningful readings, keep the main interpretation cautious.
@@ -135,7 +136,7 @@ Output Format:
 
 [Scene]
 - setting: describe the visible environment or setting neutrally
-- people: describe the visible people or characters neutrally. For each important person / character, include stable visual attributes useful for later retrieval, such as clothing, accessories, hairstyle, facial hair, apparent age group, apparent skin tone / perceived ethnicity when visually inferable, and other distinctive visible cues. Use cautious wording when uncertain.
+- people: describe the visible people or characters neutrally. 
 - roles: cautiously describe likely social or interaction roles based on visible evidence; avoid strong moral, legal, or political role assignments unless directly supported
 - high-value entities: [List any visible flags, logos, patches, symbols, slogans, salutes, portraits, uniforms, banners, or recognizable / possibly recognizable figures based on Requirement 8. For each item, include a short category tag such as [symbol], [identity-candidate], [organization], [slogan], [uniform-marker], [unknown], plus a neutral visible description. Write "None" if none are observed.]
 - context: a cautious high-level situational context based only on supported evidence
